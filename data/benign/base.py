@@ -1,1653 +1,1351 @@
-"""
-Base and utility classes for pandas objects.
-"""
+"""Base classes for all estimators and various utility functions."""
 
-from __future__ import annotations
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Generic,
-    Literal,
-    Self,
-    cast,
-    final,
-    overload,
-)
+import copy
+import functools
+import inspect
+import platform
+import re
+import warnings
+from collections import defaultdict
 
 import numpy as np
 
-from pandas._libs import lib
-from pandas._typing import (
-    AxisInt,
-    DtypeObj,
-    IndexLabel,
-    NDFrameT,
-    Shape,
-    npt,
+from sklearn import __version__
+from sklearn._config import config_context, get_config
+from sklearn.exceptions import InconsistentVersionWarning
+from sklearn.utils._metadata_requests import _MetadataRequester, _routing_enabled
+from sklearn.utils._missing import is_pandas_na, is_scalar_nan
+from sklearn.utils._param_validation import validate_parameter_constraints
+from sklearn.utils._repr_html.base import ReprHTMLMixin, _HTMLDocumentationLinkMixin
+from sklearn.utils._repr_html.estimator import estimator_html_repr
+from sklearn.utils._repr_html.params import ParamsDict
+from sklearn.utils._set_output import _SetOutputMixin
+from sklearn.utils._tags import (
+    ClassifierTags,
+    RegressorTags,
+    Tags,
+    TargetTags,
+    TransformerTags,
+    get_tags,
 )
-from pandas.compat import PYPY
-from pandas.compat.numpy import function as nv
-from pandas.errors import AbstractMethodError
-from pandas.util._decorators import cache_readonly
-
-from pandas.core.dtypes.cast import can_hold_element
-from pandas.core.dtypes.common import (
-    is_object_dtype,
-    is_scalar,
-)
-from pandas.core.dtypes.dtypes import ExtensionDtype
-from pandas.core.dtypes.generic import (
-    ABCDataFrame,
-    ABCIndex,
-    ABCMultiIndex,
-    ABCSeries,
-)
-from pandas.core.dtypes.missing import (
-    isna,
-    remove_na_arraylike,
+from sklearn.utils.fixes import _IS_32BIT
+from sklearn.utils.validation import (
+    _check_feature_names_in,
+    _generate_get_feature_names_out,
+    _is_fitted,
+    check_array,
+    check_is_fitted,
 )
 
-from pandas.core import (
-    algorithms,
-    nanops,
-    ops,
-)
-from pandas.core.accessor import DirNamesMixin
-from pandas.core.arraylike import OpsMixin
-from pandas.core.arrays import ExtensionArray
-from pandas.core.construction import (
-    ensure_wrapped_if_datetimelike,
-    extract_array,
-)
 
-if TYPE_CHECKING:
-    from collections.abc import (
-        Hashable,
-        Iterator,
-    )
+def clone(estimator, *, safe=True):
+    """Construct a new unfitted estimator with the same parameters.
 
-    from pandas._typing import (
-        DropKeep,
-        NumpySorter,
-        NumpyValueArrayLike,
-        ScalarLike_co,
-    )
+    Clone does a deep copy of the model in an estimator
+    without actually copying attached data. It returns a new estimator
+    with the same parameters that has not been fitted on any data.
 
-    from pandas import (
-        DataFrame,
-        Index,
-        Series,
-    )
+    .. versionchanged:: 1.3
+        Delegates to `estimator.__sklearn_clone__` if the method exists.
 
+    Parameters
+    ----------
+    estimator : {list, tuple, set} of estimator instance or a single \
+            estimator instance
+        The estimator or group of estimators to be cloned.
+    safe : bool, default=True
+        If safe is False, clone will fall back to a deep copy on objects
+        that are not estimators. Ignored if `estimator.__sklearn_clone__`
+        exists.
 
-class PandasObject(DirNamesMixin):
+    Returns
+    -------
+    estimator : object
+        The deep copy of the input, an estimator if input is an estimator.
+
+    Notes
+    -----
+    If the estimator's `random_state` parameter is an integer (or if the
+    estimator doesn't have a `random_state` parameter), an *exact clone* is
+    returned: the clone and the original estimator will give the exact same
+    results. Otherwise, *statistical clone* is returned: the clone might
+    return different results from the original estimator. More details can be
+    found in :ref:`randomness`.
+
+    Examples
+    --------
+    >>> from sklearn.base import clone
+    >>> from sklearn.linear_model import LogisticRegression
+    >>> X = [[-1, 0], [0, 1], [0, -1], [1, 0]]
+    >>> y = [0, 0, 1, 1]
+    >>> classifier = LogisticRegression().fit(X, y)
+    >>> cloned_classifier = clone(classifier)
+    >>> hasattr(classifier, "classes_")
+    True
+    >>> hasattr(cloned_classifier, "classes_")
+    False
+    >>> classifier is cloned_classifier
+    False
     """
-    Base class for various pandas objects.
-    """
+    if hasattr(estimator, "__sklearn_clone__") and not inspect.isclass(estimator):
+        return estimator.__sklearn_clone__()
+    return _clone_parametrized(estimator, safe=safe)
 
-    # results from calls to methods decorated with cache_readonly get added to _cache
-    _cache: dict[str, Any]
 
-    @property
-    def _constructor(self) -> type[Self]:
-        """
-        Class constructor (for this class it's just `__class__`).
-        """
-        return type(self)
+def _clone_parametrized(estimator, *, safe=True):
+    """Default implementation of clone. See :func:`sklearn.base.clone` for details."""
 
-    def __repr__(self) -> str:
-        """
-        Return a string representation for a particular object.
-        """
-        # Should be overwritten by base classes
-        return object.__repr__(self)
-
-    def _reset_cache(self, key: str | None = None) -> None:
-        """
-        Reset cached properties. If ``key`` is passed, only clears that key.
-        """
-        if not hasattr(self, "_cache"):
-            return
-        if key is None:
-            self._cache.clear()
+    estimator_type = type(estimator)
+    if estimator_type is dict:
+        return {k: clone(v, safe=safe) for k, v in estimator.items()}
+    elif estimator_type in (list, tuple, set, frozenset):
+        return estimator_type([clone(e, safe=safe) for e in estimator])
+    elif not hasattr(estimator, "get_params") or isinstance(estimator, type):
+        if not safe:
+            return copy.deepcopy(estimator)
         else:
-            self._cache.pop(key, None)
+            if isinstance(estimator, type):
+                raise TypeError(
+                    "Cannot clone object. "
+                    "You should provide an instance of "
+                    "scikit-learn estimator instead of a class."
+                )
+            else:
+                raise TypeError(
+                    "Cannot clone object '%s' (type %s): "
+                    "it does not seem to be a scikit-learn "
+                    "estimator as it does not implement a "
+                    "'get_params' method." % (repr(estimator), type(estimator))
+                )
 
-    def __sizeof__(self) -> int:
-        """
-        Generates the total memory usage for an object that returns
-        either a value or Series of values
-        """
-        memory_usage = getattr(self, "memory_usage", None)
-        if memory_usage:
-            mem = memory_usage(deep=True)
-            return int(mem if is_scalar(mem) else mem.sum())
+    klass = estimator.__class__
+    new_object_params = estimator.get_params(deep=False)
+    for name, param in new_object_params.items():
+        new_object_params[name] = clone(param, safe=False)
 
-        # no memory_usage attribute, so fall back to object's 'sizeof'
-        return super().__sizeof__()
+    new_object = klass(**new_object_params)
+    try:
+        new_object._metadata_request = copy.deepcopy(estimator._metadata_request)
+    except AttributeError:
+        pass
+
+    params_set = new_object.get_params(deep=False)
+
+    # quick sanity check of the parameters of the clone
+    for name in new_object_params:
+        param1 = new_object_params[name]
+        param2 = params_set[name]
+        if param1 is not param2:
+            raise RuntimeError(
+                "Cannot clone object %s, as the constructor "
+                "either does not set or modifies parameter %s" % (estimator, name)
+            )
+
+    # _sklearn_output_config is used by `set_output` to configure the output
+    # container of an estimator.
+    if hasattr(estimator, "_sklearn_output_config"):
+        new_object._sklearn_output_config = copy.deepcopy(
+            estimator._sklearn_output_config
+        )
+    return new_object
 
 
-class NoNewAttributesMixin:
+class BaseEstimator(ReprHTMLMixin, _HTMLDocumentationLinkMixin, _MetadataRequester):
+    """Base class for all estimators in scikit-learn.
+
+    Inheriting from this class provides default implementations of:
+
+    - setting and getting parameters used by `GridSearchCV` and friends;
+    - textual and HTML representation displayed in terminals and IDEs;
+    - estimator serialization;
+    - parameters validation;
+    - data validation;
+    - feature names validation.
+
+    Read more in the :ref:`User Guide <rolling_your_own_estimator>`.
+
+
+    Notes
+    -----
+    All estimators should specify all the parameters that can be set
+    at the class level in their ``__init__`` as explicit keyword
+    arguments (no ``*args`` or ``**kwargs``).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator
+    >>> class MyEstimator(BaseEstimator):
+    ...     def __init__(self, *, param=1):
+    ...         self.param = param
+    ...     def fit(self, X, y=None):
+    ...         self.is_fitted_ = True
+    ...         return self
+    ...     def predict(self, X):
+    ...         return np.full(shape=X.shape[0], fill_value=self.param)
+    >>> estimator = MyEstimator(param=2)
+    >>> estimator.get_params()
+    {'param': 2}
+    >>> X = np.array([[1, 2], [2, 3], [3, 4]])
+    >>> y = np.array([1, 0, 1])
+    >>> estimator.fit(X, y).predict(X)
+    array([2, 2, 2])
+    >>> estimator.set_params(param=3).fit(X, y).predict(X)
+    array([3, 3, 3])
     """
-    Mixin which prevents adding new attributes.
 
-    Prevents additional attributes via xxx.attribute = "something" after a
-    call to `self.__freeze()`. Mainly used to prevent the user from using
-    wrong attributes on an accessor (`Series.cat/.str/.dt`).
+    def __dir__(self):
+        # Filters conditional methods that should be hidden based
+        # on the `available_if` decorator
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            return [attr for attr in super().__dir__() if hasattr(self, attr)]
 
-    If you really want to add a new attribute at a later time, you need to use
-    `object.__setattr__(self, key, value)`.
-    """
+    _html_repr = estimator_html_repr
 
-    def _freeze(self) -> None:
+    @classmethod
+    def _get_param_names(cls):
+        """Get parameter names for the estimator"""
+        # fetch the constructor or the original constructor before
+        # deprecation wrapping if any
+        init = getattr(cls.__init__, "deprecated_original", cls.__init__)
+        if init is object.__init__:
+            # No explicit constructor to introspect
+            return []
+
+        # introspect the constructor arguments to find the model parameters
+        # to represent
+        init_signature = inspect.signature(init)
+        # Consider the constructor parameters excluding 'self'
+        parameters = [
+            p
+            for p in init_signature.parameters.values()
+            if p.name != "self" and p.kind != p.VAR_KEYWORD
+        ]
+        for p in parameters:
+            if p.kind == p.VAR_POSITIONAL:
+                raise RuntimeError(
+                    "scikit-learn estimators should always "
+                    "specify their parameters in the signature"
+                    " of their __init__ (no varargs)."
+                    " %s with constructor %s doesn't "
+                    " follow this convention." % (cls, init_signature)
+                )
+        # Extract and sort argument names excluding 'self'
+        return sorted([p.name for p in parameters])
+
+    def get_params(self, deep=True):
         """
-        Prevents setting additional attributes.
-        """
-        object.__setattr__(self, "__frozen", True)
-
-    # prevent adding any attribute via s.xxx.new_attribute = ...
-    def __setattr__(self, key: str, value) -> None:
-        # _cache is used by a decorator
-        # We need to check both 1.) cls.__dict__ and 2.) getattr(self, key)
-        # because
-        # 1.) getattr is false for attributes that raise errors
-        # 2.) cls.__dict__ doesn't traverse into base classes
-        if getattr(self, "__frozen", False) and not (
-            key == "_cache"
-            or key in type(self).__dict__
-            or getattr(self, key, None) is not None
-        ):
-            raise AttributeError(f"You cannot add any new attribute '{key}'")
-        object.__setattr__(self, key, value)
-
-
-class SelectionMixin(Generic[NDFrameT]):
-    """
-    mixin implementing the selection & aggregation interface on a group-like
-    object sub-classes need to define: obj, exclusions
-    """
-
-    obj: NDFrameT
-    _selection: IndexLabel | None = None
-    exclusions: frozenset[Hashable]
-    _internal_names = ["_cache", "__setstate__"]
-    _internal_names_set = set(_internal_names)
-
-    @final
-    @property
-    def _selection_list(self):
-        if not isinstance(
-            self._selection, (list, tuple, ABCSeries, ABCIndex, np.ndarray)
-        ):
-            return [self._selection]
-        return self._selection
-
-    @cache_readonly
-    def _selected_obj(self):
-        if self._selection is None or isinstance(self.obj, ABCSeries):
-            return self.obj
-        else:
-            return self.obj[self._selection]
-
-    @final
-    @cache_readonly
-    def ndim(self) -> int:
-        return self._selected_obj.ndim
-
-    @final
-    @cache_readonly
-    def _obj_with_exclusions(self):
-        if isinstance(self.obj, ABCSeries):
-            return self.obj
-
-        if self._selection is not None:
-            return self.obj[self._selection_list]
-
-        if len(self.exclusions) > 0:
-            # equivalent to `self.obj.drop(self.exclusions, axis=1)
-            #  but this avoids consolidating and making a copy
-            # TODO: following GH#45287 can we now use .drop directly without
-            #  making a copy?
-            return self.obj._drop_axis(self.exclusions, axis=1, only_slice=True)
-        else:
-            return self.obj
-
-    def __getitem__(self, key):
-        if self._selection is not None:
-            raise IndexError(f"Column(s) {self._selection} already selected")
-
-        if isinstance(key, (list, tuple, ABCSeries, ABCIndex, np.ndarray)):
-            if len(self.obj.columns.intersection(key)) != len(set(key)):
-                bad_keys = list(set(key).difference(self.obj.columns))
-                raise KeyError(f"Columns not found: {str(bad_keys)[1:-1]}")
-            return self._gotitem(list(key), ndim=2)
-
-        else:
-            if key not in self.obj:
-                raise KeyError(f"Column not found: {key}")
-            ndim = self.obj[key].ndim
-            return self._gotitem(key, ndim=ndim)
-
-    def _gotitem(self, key, ndim: int, subset=None):
-        """
-        sub-classes to define
-        return a sliced object
+        Get parameters for this estimator.
 
         Parameters
         ----------
-        key : str / list of selections
-        ndim : {1, 2}
-            requested ndim of result
-        subset : object, default None
-            subset to act on
-        """
-        raise AbstractMethodError(self)
-
-    @final
-    def _infer_selection(self, key, subset: Series | DataFrame):
-        """
-        Infer the `selection` to pass to our constructor in _gotitem.
-        """
-        # Shared by Rolling and Resample
-        selection = None
-        if subset.ndim == 2 and (
-            (lib.is_scalar(key) and key in subset) or lib.is_list_like(key)
-        ):
-            selection = key
-        elif subset.ndim == 1 and lib.is_scalar(key) and key == subset.name:
-            selection = key
-        return selection
-
-    def aggregate(self, func, *args, **kwargs):
-        raise AbstractMethodError(self)
-
-    agg = aggregate
-
-
-class IndexOpsMixin(OpsMixin):
-    """
-    Common ops mixin to support a unified interface / docs for Series / Index
-    """
-
-    # ndarray compatibility
-    __array_priority__ = 1000
-    _hidden_attrs: frozenset[str] = frozenset(
-        ["tolist"]  # tolist is not deprecated, just suppressed in the __dir__
-    )
-
-    @property
-    def dtype(self) -> DtypeObj:
-        # must be defined here as a property for mypy
-        raise AbstractMethodError(self)
-
-    @property
-    def _values(self) -> ExtensionArray | np.ndarray:
-        # must be defined here as a property for mypy
-        raise AbstractMethodError(self)
-
-    @final
-    def transpose(self, *args, **kwargs) -> Self:
-        """
-        Return the transpose, which is by definition self.
+        deep : bool, default=True
+            If True, will return the parameters for this estimator and
+            contained subobjects that are estimators.
 
         Returns
         -------
-        %(klass)s
+        params : dict
+            Parameter names mapped to their values.
         """
-        nv.validate_transpose(args, kwargs)
+        out = dict()
+        for key in self._get_param_names():
+            value = getattr(self, key)
+            if deep and hasattr(value, "get_params") and not isinstance(value, type):
+                deep_items = value.get_params().items()
+                out.update((key + "__" + k, val) for k, val in deep_items)
+            out[key] = value
+        return out
+
+    def _get_params_html(self, deep=True, doc_link=""):
+        """
+        Get parameters for this estimator with a specific HTML representation.
+
+        Parameters
+        ----------
+        deep : bool, default=True
+            If True, will return the parameters for this estimator and
+            contained subobjects that are estimators.
+
+        doc_link : str
+            URL to the estimator documentation.
+            Used for linking to the estimator's parameters documentation
+            available in HTML displays.
+
+        Returns
+        -------
+        params : ParamsDict
+            Parameter names mapped to their values. We return a `ParamsDict`
+            dictionary, which renders a specific HTML representation in table
+            form.
+        """
+        out = self.get_params(deep=deep)
+
+        init_func = getattr(self.__init__, "deprecated_original", self.__init__)
+        init_default_params = inspect.signature(init_func).parameters
+        init_default_params = {
+            name: param.default for name, param in init_default_params.items()
+        }
+
+        def is_non_default(param_name, param_value):
+            """Finds the parameters that have been set by the user."""
+            if param_name not in init_default_params:
+                # happens if k is part of a **kwargs
+                return True
+            if init_default_params[param_name] == inspect._empty:
+                # k has no default value
+                return True
+            # avoid calling repr on nested estimators
+            if isinstance(param_value, BaseEstimator) and type(param_value) is not type(
+                init_default_params[param_name]
+            ):
+                return True
+            if is_pandas_na(param_value) and not is_pandas_na(
+                init_default_params[param_name]
+            ):
+                return True
+            if not np.array_equal(
+                param_value, init_default_params[param_name]
+            ) and not (
+                is_scalar_nan(init_default_params[param_name])
+                and is_scalar_nan(param_value)
+            ):
+                return True
+
+            return False
+
+        # Sort parameters so non-default parameters are shown first
+        unordered_params = {
+            name: out[name] for name in init_default_params if name in out
+        }
+        unordered_params.update(
+            {
+                name: value
+                for name, value in out.items()
+                if name not in init_default_params
+            }
+        )
+
+        non_default_params, default_params = [], []
+        for name, value in unordered_params.items():
+            if is_non_default(name, value):
+                non_default_params.append(name)
+            else:
+                default_params.append(name)
+
+        params = {name: out[name] for name in non_default_params + default_params}
+
+        return ParamsDict(
+            params=params,
+            non_default=tuple(non_default_params),
+            estimator_class=self.__class__,
+            doc_link=doc_link,
+        )
+
+    def set_params(self, **params):
+        """Set the parameters of this estimator.
+
+        The method works on simple estimators as well as on nested objects
+        (such as :class:`~sklearn.pipeline.Pipeline`). The latter have
+        parameters of the form ``<component>__<parameter>`` so that it's
+        possible to update each component of a nested object.
+
+        Parameters
+        ----------
+        **params : dict
+            Estimator parameters.
+
+        Returns
+        -------
+        self : estimator instance
+            Estimator instance.
+        """
+        if not params:
+            # Simple optimization to gain speed (inspect is slow)
+            return self
+        valid_params = self.get_params(deep=True)
+
+        nested_params = defaultdict(dict)  # grouped by prefix
+        for key, value in params.items():
+            key, delim, sub_key = key.partition("__")
+            if key not in valid_params:
+                local_valid_params = self._get_param_names()
+                raise ValueError(
+                    f"Invalid parameter {key!r} for estimator {self}. "
+                    f"Valid parameters are: {local_valid_params!r}."
+                )
+
+            if delim:
+                nested_params[key][sub_key] = value
+            else:
+                setattr(self, key, value)
+                valid_params[key] = value
+
+        for key, sub_params in nested_params.items():
+            valid_params[key].set_params(**sub_params)
+
         return self
 
-    T = property(
-        transpose,
-        doc="""
-        Return the transpose, which is by definition self.
+    def __sklearn_clone__(self):
+        return _clone_parametrized(self)
 
-        See Also
-        --------
-        Index : Immutable sequence used for indexing and alignment.
+    def __repr__(self, N_CHAR_MAX=700):
+        # N_CHAR_MAX is the (approximate) maximum number of non-blank
+        # characters to render. We pass it as an optional parameter to ease
+        # the tests.
 
-        Examples
-        --------
-        For Series:
+        from sklearn.utils._pprint import _EstimatorPrettyPrinter
 
-        >>> s = pd.Series(['Ant', 'Bear', 'Cow'])
-        >>> s
-        0     Ant
-        1    Bear
-        2     Cow
-        dtype: str
-        >>> s.T
-        0     Ant
-        1    Bear
-        2     Cow
-        dtype: str
+        N_MAX_ELEMENTS_TO_SHOW = 30  # number of elements to show in sequences
 
-        For Index:
+        # use ellipsis for sequences with a lot of elements
+        pp = _EstimatorPrettyPrinter(
+            compact=True,
+            indent=1,
+            indent_at_name=True,
+            n_max_elements_to_show=N_MAX_ELEMENTS_TO_SHOW,
+        )
 
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx.T
-        Index([1, 2, 3], dtype='int64')
-        """,
-    )
+        repr_ = pp.pformat(self)
 
-    @property
-    def shape(self) -> Shape:
-        """
-        Return a tuple of the shape of the underlying data.
+        # Use bruteforce ellipsis when there are a lot of non-blank characters
+        n_nonblank = len("".join(repr_.split()))
+        if n_nonblank > N_CHAR_MAX:
+            lim = N_CHAR_MAX // 2  # apprx number of chars to keep on both ends
+            regex = r"^(\s*\S){%d}" % lim
+            # The regex '^(\s*\S){%d}' % n
+            # matches from the start of the string until the nth non-blank
+            # character:
+            # - ^ matches the start of string
+            # - (pattern){n} matches n repetitions of pattern
+            # - \s*\S matches a non-blank char following zero or more blanks
+            left_lim = re.match(regex, repr_).end()
+            right_lim = re.match(regex, repr_[::-1]).end()
 
-        See Also
-        --------
-        Series.ndim : Number of dimensions of the underlying data.
-        Series.size : Return the number of elements in the underlying data.
-        Series.nbytes : Return the number of bytes in the underlying data.
+            if "\n" in repr_[left_lim:-right_lim]:
+                # The left side and right side aren't on the same line.
+                # To avoid weird cuts, e.g.:
+                # categoric...ore',
+                # we need to start the right side with an appropriate newline
+                # character so that it renders properly as:
+                # categoric...
+                # handle_unknown='ignore',
+                # so we add [^\n]*\n which matches until the next \n
+                regex += r"[^\n]*\n"
+                right_lim = re.match(regex, repr_[::-1]).end()
 
-        Examples
-        --------
-        >>> s = pd.Series([1, 2, 3])
-        >>> s.shape
-        (3,)
-        """
-        return self._values.shape
+            ellipsis = "..."
+            if left_lim + len(ellipsis) < len(repr_) - right_lim:
+                # Only add ellipsis if it results in a shorter repr
+                repr_ = repr_[:left_lim] + "..." + repr_[-right_lim:]
 
-    def __len__(self) -> int:
-        # We need this defined here for mypy
-        raise AbstractMethodError(self)
+        return repr_
 
-    # Temporarily avoid using `-> Literal[1]:` because of an IPython (jedi) bug
-    # https://github.com/ipython/ipython/issues/14412
-    # https://github.com/davidhalter/jedi/issues/1990
-    @property
-    def ndim(self) -> int:
-        """
-        Number of dimensions of the underlying data, by definition 1.
-
-        See Also
-        --------
-        Series.size: Return the number of elements in the underlying data.
-        Series.shape: Return a tuple of the shape of the underlying data.
-        Series.dtype: Return the dtype object of the underlying data.
-        Series.values: Return Series as ndarray or ndarray-like depending on the dtype.
-
-        Examples
-        --------
-        >>> s = pd.Series(["Ant", "Bear", "Cow"])
-        >>> s
-        0     Ant
-        1    Bear
-        2     Cow
-        dtype: str
-        >>> s.ndim
-        1
-
-        For Index:
-
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx
-        Index([1, 2, 3], dtype='int64')
-        >>> idx.ndim
-        1
-        """
-        return 1
-
-    @final
-    def item(self):
-        """
-        Return the first element of the underlying data as a Python scalar.
-
-        Returns
-        -------
-        scalar
-            The first element of Series or Index.
-
-        Raises
-        ------
-        ValueError
-            If the data is not length = 1.
-
-        See Also
-        --------
-        Index.values : Returns an array representing the data in the Index.
-        Series.head : Returns the first `n` rows.
-
-        Examples
-        --------
-        >>> s = pd.Series([1])
-        >>> s.item()
-        1
-
-        For an index:
-
-        >>> s = pd.Series([1], index=["a"])
-        >>> s.index.item()
-        'a'
-        """
-        if len(self) == 1:
-            return next(iter(self))
-        raise ValueError("can only convert an array of size 1 to a Python scalar")
-
-    @property
-    def nbytes(self) -> int:
-        """
-        Return the number of bytes in the underlying data.
-
-        See Also
-        --------
-        Series.ndim : Number of dimensions of the underlying data.
-        Series.size : Return the number of elements in the underlying data.
-
-        Examples
-        --------
-        For Series:
-
-        >>> s = pd.Series(["Ant", "Bear", "Cow"])
-        >>> s
-        0     Ant
-        1    Bear
-        2     Cow
-        dtype: str
-        >>> s.nbytes
-        34
-
-        For Index:
-
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx
-        Index([1, 2, 3], dtype='int64')
-        >>> idx.nbytes
-        24
-        """
-        return self._values.nbytes
-
-    @property
-    def size(self) -> int:
-        """
-        Return the number of elements in the underlying data.
-
-        See Also
-        --------
-        Series.ndim: Number of dimensions of the underlying data, by definition 1.
-        Series.shape: Return a tuple of the shape of the underlying data.
-        Series.dtype: Return the dtype object of the underlying data.
-        Series.values: Return Series as ndarray or ndarray-like depending on the dtype.
-
-        Examples
-        --------
-        For Series:
-
-        >>> s = pd.Series(["Ant", "Bear", "Cow"])
-        >>> s
-        0     Ant
-        1    Bear
-        2     Cow
-        dtype: str
-        >>> s.size
-        3
-
-        For Index:
-
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx
-        Index([1, 2, 3], dtype='int64')
-        >>> idx.size
-        3
-        """
-        return len(self._values)
-
-    @property
-    def array(self) -> ExtensionArray:
-        """
-        The ExtensionArray of the data backing this Series or Index.
-
-        This property provides direct access to the underlying array data of a
-        Series or Index without requiring conversion to a NumPy array. It
-        returns an ExtensionArray, which is the native storage format for
-        pandas extension dtypes.
-
-        Returns
-        -------
-        ExtensionArray
-            An ExtensionArray of the values stored within. For extension
-            types, this is the actual array. For NumPy native types, this
-            is a thin (no copy) wrapper around :class:`numpy.ndarray`.
-
-            ``.array`` differs from ``.values``, which may require converting
-            the data to a different form.
-
-        See Also
-        --------
-        Index.to_numpy : Similar method that always returns a NumPy array.
-        Series.to_numpy : Similar method that always returns a NumPy array.
-
-        Notes
-        -----
-        This table lays out the different array types for each extension
-        dtype within pandas.
-
-        ================== =============================
-        dtype              array type
-        ================== =============================
-        category           Categorical
-        period             PeriodArray
-        interval           IntervalArray
-        IntegerNA          IntegerArray
-        string             StringArray
-        boolean            BooleanArray
-        datetime64[ns, tz] DatetimeArray
-        ================== =============================
-
-        For any 3rd-party extension types, the array type will be an
-        ExtensionArray.
-
-        For all remaining dtypes ``.array`` will be a
-        :class:`arrays.NumpyExtensionArray` wrapping the actual ndarray
-        stored within. If you absolutely need a NumPy array (possibly with
-        copying / coercing data), then use :meth:`Series.to_numpy` instead.
-
-        Examples
-        --------
-        For regular NumPy types like int, and float, a NumpyExtensionArray
-        is returned.
-
-        >>> pd.Series([1, 2, 3]).array
-        <NumpyExtensionArray>
-        [1, 2, 3]
-        Length: 3, dtype: int64
-
-        For extension types, like Categorical, the actual ExtensionArray
-        is returned
-
-        >>> ser = pd.Series(pd.Categorical(["a", "b", "a"]))
-        >>> ser.array
-        ['a', 'b', 'a']
-        Categories (2, str): ['a', 'b']
-        """
-        raise AbstractMethodError(self)
-
-    def to_numpy(
-        self,
-        dtype: npt.DTypeLike | None = None,
-        copy: bool = False,
-        na_value: object = lib.no_default,
-        **kwargs,
-    ) -> np.ndarray:
-        """
-        A NumPy ndarray representing the values in this Series or Index.
-
-        Parameters
-        ----------
-        dtype : str or numpy.dtype, optional
-            The dtype to pass to :meth:`numpy.asarray`.
-        copy : bool, default False
-            Whether to ensure that the returned value is not a view on
-            another array. Note that ``copy=False`` does not *ensure* that
-            ``to_numpy()`` is no-copy. Rather, ``copy=True`` ensure that
-            a copy is made, even if not strictly necessary.
-        na_value : Any, optional
-            The value to use for missing values. The default value depends
-            on `dtype` and the type of the array.
-        **kwargs
-            Additional keywords passed through to the ``to_numpy`` method
-            of the underlying array (for extension arrays).
-
-        Returns
-        -------
-        numpy.ndarray
-            The NumPy ndarray holding the values from this Series or Index.
-            The dtype of the array may differ. See Notes.
-
-        See Also
-        --------
-        Series.array : Get the actual data stored within.
-        Index.array : Get the actual data stored within.
-        DataFrame.to_numpy : Similar method for DataFrame.
-
-        Notes
-        -----
-        The returned array will be the same up to equality (values equal
-        in `self` will be equal in the returned array; likewise for values
-        that are not equal). When `self` contains an ExtensionArray, the
-        dtype may be different. For example, for a category-dtype Series,
-        ``to_numpy()`` will return a NumPy array and the categorical dtype
-        will be lost.
-
-        For NumPy dtypes, this will be a reference to the actual data stored
-        in this Series or Index (assuming ``copy=False``). Modifying the result
-        in place will modify the data stored in the Series or Index (not that
-        we recommend doing that).
-
-        For extension types, ``to_numpy()`` *may* require copying data and
-        coercing the result to a NumPy type (possibly object), which may be
-        expensive. When you need a no-copy reference to the underlying data,
-        :attr:`Series.array` should be used instead.
-
-        This table lays out the different dtypes and default return types of
-        ``to_numpy()`` for various dtypes within pandas.
-
-        ================== ================================
-        dtype              array type
-        ================== ================================
-        category[T]        ndarray[T] (same dtype as input)
-        period             ndarray[object] (Periods)
-        interval           ndarray[object] (Intervals)
-        IntegerNA          ndarray[object]
-        datetime64[ns]     datetime64[ns]
-        datetime64[ns, tz] ndarray[object] (Timestamps)
-        ================== ================================
-
-        Examples
-        --------
-        >>> ser = pd.Series(pd.Categorical(["a", "b", "a"]))
-        >>> ser.to_numpy()
-        array(['a', 'b', 'a'], dtype=object)
-
-        Specify the `dtype` to control how datetime-aware data is represented.
-        Use ``dtype=object`` to return an ndarray of pandas :class:`Timestamp`
-        objects, each with the correct ``tz``.
-
-        >>> ser = pd.Series(pd.date_range("2000", periods=2, tz="CET"))
-        >>> ser.to_numpy(dtype=object)
-        array([Timestamp('2000-01-01 00:00:00+0100', tz='CET'),
-               Timestamp('2000-01-02 00:00:00+0100', tz='CET')],
-              dtype=object)
-
-        Or ``dtype='datetime64[ns]'`` to return an ndarray of native
-        datetime64 values. The values are converted to UTC and the timezone
-        info is dropped.
-
-        >>> ser.to_numpy(dtype="datetime64[ns]")
-        ... # doctest: +ELLIPSIS
-        array(['1999-12-31T23:00:00.000000000', '2000-01-01T23:00:00...'],
-              dtype='datetime64[ns]')
-        """
-        if isinstance(self.dtype, ExtensionDtype):
-            return self.array.to_numpy(dtype, copy=copy, na_value=na_value, **kwargs)
-        elif kwargs:
-            bad_keys = next(iter(kwargs.keys()))
+    def __getstate__(self):
+        if getattr(self, "__slots__", None):
             raise TypeError(
-                f"to_numpy() got an unexpected keyword argument '{bad_keys}'"
+                "You cannot use `__slots__` in objects inheriting from "
+                "`sklearn.base.BaseEstimator`."
             )
 
-        fillna = (
-            na_value is not lib.no_default
-            # no need to fillna with np.nan if we already have a float dtype
-            and not (na_value is np.nan and np.issubdtype(self.dtype, np.floating))
+        try:
+            state = super().__getstate__()
+            if state is None:
+                # For Python 3.11+, empty instance (no `__slots__`,
+                # and `__dict__`) will return a state equal to `None`.
+                state = self.__dict__.copy()
+        except AttributeError:
+            # Python < 3.11
+            state = self.__dict__.copy()
+
+        if type(self).__module__.startswith("sklearn."):
+            return dict(state.items(), _sklearn_version=__version__)
+        else:
+            return state
+
+    def __setstate__(self, state):
+        if type(self).__module__.startswith("sklearn."):
+            pickle_version = state.pop("_sklearn_version", "pre-0.18")
+            if pickle_version != __version__:
+                warnings.warn(
+                    InconsistentVersionWarning(
+                        estimator_name=self.__class__.__name__,
+                        current_sklearn_version=__version__,
+                        original_sklearn_version=pickle_version,
+                    ),
+                )
+        try:
+            super().__setstate__(state)
+        except AttributeError:
+            self.__dict__.update(state)
+
+    def __sklearn_tags__(self):
+        return Tags(
+            estimator_type=None,
+            target_tags=TargetTags(required=False),
+            transformer_tags=None,
+            regressor_tags=None,
+            classifier_tags=None,
         )
 
-        values = self._values
-        if fillna and self.hasnans:
-            if not can_hold_element(values, na_value):
-                # if we can't hold the na_value asarray either makes a copy or we
-                # error before modifying values. The asarray later on thus won't make
-                # another copy
-                values = np.asarray(values, dtype=dtype)
-            else:
-                values = values.copy()
+    def _validate_params(self):
+        """Validate types and values of constructor parameters
 
-            values[np.asanyarray(isna(self))] = na_value
-
-        result = np.asarray(values, dtype=dtype)
-
-        if (copy and not fillna) or not copy:
-            if np.shares_memory(self._values[:2], result[:2]):
-                # Take slices to improve performance of check
-                if not copy:
-                    result = result.view()
-                    result.flags.writeable = False
-                else:
-                    result = result.copy()
-
-        return result
-
-    @final
-    @property
-    def empty(self) -> bool:
+        The expected type and values must be defined in the `_parameter_constraints`
+        class attribute, which is a dictionary `param_name: list of constraints`. See
+        the docstring of `validate_parameter_constraints` for a description of the
+        accepted constraints.
         """
-        Indicator whether Index is empty.
-
-        An Index is considered empty if it has no elements. This property can be
-        useful for quickly checking the state of an Index, especially in data
-        processing and analysis workflows where handling of empty datasets might
-        be required.
-
-        Returns
-        -------
-        bool
-            If Index is empty, return True, if not return False.
-
-        See Also
-        --------
-        Index.size : Return the number of elements in the underlying data.
-
-        Examples
-        --------
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx
-        Index([1, 2, 3], dtype='int64')
-        >>> idx.empty
-        False
-
-        >>> idx_empty = pd.Index([])
-        >>> idx_empty
-        Index([], dtype='object')
-        >>> idx_empty.empty
-        True
-
-        If we only have NaNs in our DataFrame, it is not considered empty!
-
-        >>> idx = pd.Index([np.nan, np.nan])
-        >>> idx
-        Index([nan, nan], dtype='float64')
-        >>> idx.empty
-        False
-        """
-        return not self.size
-
-    def argmax(
-        self, axis: AxisInt | None = None, skipna: bool = True, *args, **kwargs
-    ) -> int:
-        """
-        Return int position of the largest value in the Series.
-
-        If the maximum is achieved in multiple locations,
-        the first row position is returned.
-
-        Parameters
-        ----------
-        axis : None
-            Unused. Parameter needed for compatibility with DataFrame.
-        skipna : bool, default True
-            Exclude NA/null values. If the entire Series is NA, or if ``skipna=False``
-            and there is an NA value, this method will raise a ``ValueError``.
-        *args, **kwargs
-            Additional arguments and keywords for compatibility with NumPy.
-
-        Returns
-        -------
-        int
-            Row position of the maximum value.
-
-        See Also
-        --------
-        Series.argmax : Return position of the maximum value.
-        Series.argmin : Return position of the minimum value.
-        numpy.ndarray.argmax : Equivalent method for numpy arrays.
-        Series.idxmax : Return index label of the maximum values.
-        Series.idxmin : Return index label of the minimum values.
-
-        Examples
-        --------
-        Consider dataset containing cereal calories
-
-        >>> s = pd.Series(
-        ...     [100.0, 110.0, 120.0, 110.0],
-        ...     index=[
-        ...         "Corn Flakes",
-        ...         "Almond Delight",
-        ...         "Cinnamon Toast Crunch",
-        ...         "Cocoa Puff",
-        ...     ],
-        ... )
-        >>> s
-        Corn Flakes              100.0
-        Almond Delight           110.0
-        Cinnamon Toast Crunch    120.0
-        Cocoa Puff               110.0
-        dtype: float64
-
-        >>> s.argmax()
-        np.int64(2)
-        >>> s.argmin()
-        np.int64(0)
-
-        The maximum cereal calories is the third element and
-        the minimum cereal calories is the first element,
-        since series is zero-indexed.
-        """
-        delegate = self._values
-        nv.validate_minmax_axis(axis)
-        skipna = nv.validate_argmax_with_skipna(skipna, args, kwargs)
-
-        if isinstance(delegate, ExtensionArray):
-            return delegate.argmax(skipna=skipna)
-        else:
-            result = nanops.nanargmax(delegate, skipna=skipna)
-            # error: Incompatible return value type (got "Union[int, ndarray]", expected
-            # "int")
-            return result  # type: ignore[return-value]
-
-    def argmin(
-        self, axis: AxisInt | None = None, skipna: bool = True, *args, **kwargs
-    ) -> int:
-        """
-        Return int position of the smallest value in the Series.
-
-        If the minimum is achieved in multiple locations,
-        the first row position is returned.
-
-        Parameters
-        ----------
-        axis : None
-            Unused. Parameter needed for compatibility with DataFrame.
-        skipna : bool, default True
-            Exclude NA/null values. If the entire Series is NA, or if ``skipna=False``
-            and there is an NA value, this method will raise a ``ValueError``.
-        *args, **kwargs
-            Additional arguments and keywords for compatibility with NumPy.
-
-        Returns
-        -------
-        int
-            Row position of the minimum value.
-
-        See Also
-        --------
-        Series.argmin : Return position of the minimum value.
-        Series.argmax : Return position of the maximum value.
-        numpy.ndarray.argmin : Equivalent method for numpy arrays.
-        Series.idxmin : Return index label of the minimum values.
-        Series.idxmax : Return index label of the maximum values.
-
-        Examples
-        --------
-        Consider dataset containing cereal calories
-
-        >>> s = pd.Series(
-        ...     [100.0, 110.0, 120.0, 110.0],
-        ...     index=[
-        ...         "Corn Flakes",
-        ...         "Almond Delight",
-        ...         "Cinnamon Toast Crunch",
-        ...         "Cocoa Puff",
-        ...     ],
-        ... )
-        >>> s
-        Corn Flakes              100.0
-        Almond Delight           110.0
-        Cinnamon Toast Crunch    120.0
-        Cocoa Puff               110.0
-        dtype: float64
-
-        >>> s.argmax()
-        np.int64(2)
-        >>> s.argmin()
-        np.int64(0)
-
-        The maximum cereal calories is the third element and
-        the minimum cereal calories is the first element,
-        since series is zero-indexed.
-        """
-        delegate = self._values
-        nv.validate_minmax_axis(axis)
-        skipna = nv.validate_argmax_with_skipna(skipna, args, kwargs)
-
-        if isinstance(delegate, ExtensionArray):
-            return delegate.argmin(skipna=skipna)
-        else:
-            result = nanops.nanargmin(delegate, skipna=skipna)
-            # error: Incompatible return value type (got "Union[int, ndarray]", expected
-            # "int")
-            return result  # type: ignore[return-value]
-
-    def tolist(self) -> list:
-        """
-        Return a list of the values.
-
-        These are each a scalar type, which is a Python scalar
-        (for str, int, float) or a pandas scalar
-        (for Timestamp/Timedelta/Interval/Period)
-
-        Returns
-        -------
-        list
-            List containing the values as Python or pandas scalers.
-
-        See Also
-        --------
-        numpy.ndarray.tolist : Return the array as an a.ndim-levels deep
-            nested list of Python scalars.
-
-        Examples
-        --------
-        For Series
-
-        >>> s = pd.Series([1, 2, 3])
-        >>> s.to_list()
-        [1, 2, 3]
-
-        For Index:
-
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx
-        Index([1, 2, 3], dtype='int64')
-
-        >>> idx.to_list()
-        [1, 2, 3]
-        """
-        return self._values.tolist()
-
-    to_list = tolist
-
-    def __iter__(self) -> Iterator:
-        """
-        Return an iterator of the values.
-
-        These are each a scalar type, which is a Python scalar
-        (for str, int, float) or a pandas scalar
-        (for Timestamp/Timedelta/Interval/Period)
-
-        Returns
-        -------
-        iterator
-            An iterator yielding scalar values from the Series.
-
-        See Also
-        --------
-        Series.items : Lazily iterate over (index, value) tuples.
-
-        Examples
-        --------
-        >>> s = pd.Series([1, 2, 3])
-        >>> for x in s:
-        ...     print(x)
-        1
-        2
-        3
-        """
-        # We are explicitly making element iterators.
-        if not isinstance(self._values, np.ndarray):
-            # Check type instead of dtype to catch DTA/TDA
-            return iter(self._values)
-        else:
-            return map(self._values.item, range(self._values.size))
-
-    @cache_readonly
-    def hasnans(self) -> bool:
-        """
-        Return True if there are any NaNs.
-
-        Enables various performance speedups.
-
-        Returns
-        -------
-        bool
-
-        See Also
-        --------
-        Series.isna : Detect missing values.
-        Series.notna : Detect existing (non-missing) values.
-
-        Examples
-        --------
-        >>> s = pd.Series([1, 2, 3, None])
-        >>> s
-        0    1.0
-        1    2.0
-        2    3.0
-        3    NaN
-        dtype: float64
-        >>> s.hasnans
-        True
-        """
-        # error: Item "bool" of "Union[bool, ndarray[Any, dtype[bool_]], NDFrame]"
-        # has no attribute "any"
-        return bool(isna(self).any())  # type: ignore[union-attr]
-
-    @final
-    def _map_values(self, mapper, na_action=None):
-        """
-        An internal function that maps values using the input
-        correspondence (which can be a dict, Series, or function).
-
-        Parameters
-        ----------
-        mapper : function, dict, or Series
-            The input correspondence object
-        na_action : {None, 'ignore'}
-            If 'ignore', propagate NA values, without passing them to the
-            mapping function
-
-        Returns
-        -------
-        Union[Index, MultiIndex], inferred
-            The output of the mapping function applied to the index.
-            If the function returns a tuple with more than one element
-            a MultiIndex will be returned.
-        """
-        arr = self._values
-
-        if isinstance(arr, ExtensionArray):
-            return arr.map(mapper, na_action=na_action)
-
-        return algorithms.map_array(arr, mapper, na_action=na_action)
-
-    def value_counts(
-        self,
-        normalize: bool = False,
-        sort: bool = True,
-        ascending: bool = False,
-        bins=None,
-        dropna: bool = True,
-    ) -> Series:
-        """
-        Return a Series containing counts of unique values.
-
-        The resulting object will be in descending order so that the
-        first element is the most frequently-occurring element.
-        Excludes NA values by default.
-
-        Parameters
-        ----------
-        normalize : bool, default False
-            If True then the object returned will contain the relative
-            frequencies of the unique values.
-        sort : bool, default True
-            Stable sort by frequencies when True. Preserve the order of the data
-            when False.
-
-            .. versionchanged:: 3.0.0
-
-                Prior to 3.0.0, the sort was unstable.
-        ascending : bool, default False
-            Sort in ascending order.
-        bins : int, optional
-            Rather than count values, group them into half-open bins,
-            a convenience for ``pd.cut``, only works with numeric data.
-        dropna : bool, default True
-            Don't include counts of NaN.
-
-        Returns
-        -------
-        Series
-            Series containing counts of unique values.
-
-        See Also
-        --------
-        Series.count: Number of non-NA elements in a Series.
-        DataFrame.count: Number of non-NA elements in a DataFrame.
-        DataFrame.value_counts: Equivalent method on DataFrames.
-
-        Examples
-        --------
-        >>> index = pd.Index([3, 1, 2, 3, 4, np.nan])
-        >>> index.value_counts()
-        3.0    2
-        1.0    1
-        2.0    1
-        4.0    1
-        Name: count, dtype: int64
-
-        With `normalize` set to `True`, returns the relative frequency by
-        dividing all values by the sum of values.
-
-        >>> s = pd.Series([3, 1, 2, 3, 4, np.nan])
-        >>> s.value_counts(normalize=True)
-        3.0    0.4
-        1.0    0.2
-        2.0    0.2
-        4.0    0.2
-        Name: proportion, dtype: float64
-
-        **bins**
-
-        Bins can be useful for going from a continuous variable to a
-        categorical variable; instead of counting unique
-        apparitions of values, divide the index in the specified
-        number of half-open bins.
-
-        >>> s.value_counts(bins=3)
-        (0.996, 2.0]    2
-        (2.0, 3.0]      2
-        (3.0, 4.0]      1
-        Name: count, dtype: int64
-
-        **dropna**
-
-        With `dropna` set to `False` we can also see NaN index values.
-
-        >>> s.value_counts(dropna=False)
-        3.0    2
-        1.0    1
-        2.0    1
-        4.0    1
-        NaN    1
-        Name: count, dtype: int64
-
-        **Categorical Dtypes**
-
-        Rows with categorical type will be counted as one group
-        if they have same categories and order.
-        In the example below, even though ``a``, ``c``, and ``d``
-        all have the same data types of ``category``,
-        only ``c`` and ``d`` will be counted as one group
-        since ``a`` doesn't have the same categories.
-
-        >>> df = pd.DataFrame({"a": [1], "b": ["2"], "c": [3], "d": [3]})
-        >>> df = df.astype({"a": "category", "c": "category", "d": "category"})
-        >>> df
-           a  b  c  d
-        0  1  2  3  3
-
-        >>> df.dtypes
-        a    category
-        b      str
-        c    category
-        d    category
-        dtype: object
-
-        >>> df.dtypes.value_counts()
-        category    2
-        category    1
-        str         1
-        Name: count, dtype: int64
-        """
-        return algorithms.value_counts_internal(
-            self,
-            sort=sort,
-            ascending=ascending,
-            normalize=normalize,
-            bins=bins,
-            dropna=dropna,
+        validate_parameter_constraints(
+            self._parameter_constraints,
+            self.get_params(deep=False),
+            caller_name=self.__class__.__name__,
         )
 
-    def unique(self):
-        values = self._values
-        if not isinstance(values, np.ndarray):
-            # i.e. ExtensionArray
-            result = values.unique()
-        else:
-            result = algorithms.unique1d(values)  # type: ignore[assignment]
-        return result
 
-    @final
-    def nunique(self, dropna: bool = True) -> int:
+class ClassifierMixin:
+    """Mixin class for all classifiers in scikit-learn.
+
+    This mixin defines the following functionality:
+
+    - set estimator type to `"classifier"` through the `estimator_type` tag;
+    - `score` method that default to :func:`~sklearn.metrics.accuracy_score`.
+    - enforce that `fit` requires `y` to be passed through the `requires_y` tag,
+      which is done by setting the classifier type tag.
+
+    Read more in the :ref:`User Guide <rolling_your_own_estimator>`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, ClassifierMixin
+    >>> # Mixin classes should always be on the left-hand side for a correct MRO
+    >>> class MyEstimator(ClassifierMixin, BaseEstimator):
+    ...     def __init__(self, *, param=1):
+    ...         self.param = param
+    ...     def fit(self, X, y=None):
+    ...         self.is_fitted_ = True
+    ...         return self
+    ...     def predict(self, X):
+    ...         return np.full(shape=X.shape[0], fill_value=self.param)
+    >>> estimator = MyEstimator(param=1)
+    >>> X = np.array([[1, 2], [2, 3], [3, 4]])
+    >>> y = np.array([1, 0, 1])
+    >>> estimator.fit(X, y).predict(X)
+    array([1, 1, 1])
+    >>> estimator.score(X, y)
+    0.66...
+    """
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "classifier"
+        tags.classifier_tags = ClassifierTags()
+        tags.target_tags.required = True
+        return tags
+
+    def score(self, X, y, sample_weight=None):
         """
-        Return number of unique elements in the object.
+        Return :ref:`accuracy <accuracy_score>` on provided data and labels.
 
-        Excludes NA values by default.
+        In multi-label classification, this is the subset accuracy
+        which is a harsh metric since you require for each sample that
+        each label set be correctly predicted.
 
         Parameters
         ----------
-        dropna : bool, default True
-            Don't include NaN in the count.
+        X : array-like of shape (n_samples, n_features)
+            Test samples.
+
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            True labels for `X`.
+
+        sample_weight : array-like of shape (n_samples,), default=None
+            Sample weights.
 
         Returns
         -------
-        int
-            An integer indicating the number of unique elements in the object.
-
-        See Also
-        --------
-        DataFrame.nunique: Method nunique for DataFrame.
-        Series.count: Count non-NA/null observations in the Series.
-
-        Examples
-        --------
-        >>> s = pd.Series([1, 3, 5, 7, 7])
-        >>> s
-        0    1
-        1    3
-        2    5
-        3    7
-        4    7
-        dtype: int64
-
-        >>> s.nunique()
-        4
+        score : float
+            Mean accuracy of ``self.predict(X)`` w.r.t. `y`.
         """
-        uniqs = self.unique()
-        if dropna:
-            uniqs = remove_na_arraylike(uniqs)
-        return len(uniqs)
+        from sklearn.metrics import accuracy_score
 
-    @property
-    def is_unique(self) -> bool:
-        """
-        Return True if values in the object are unique.
+        return accuracy_score(y, self.predict(X), sample_weight=sample_weight)
 
-        Returns
-        -------
-        bool
 
-        See Also
-        --------
-        Series.unique : Return unique values of Series object.
-        Series.drop_duplicates : Return Series with duplicate values removed.
-        Series.duplicated : Indicate duplicate Series values.
+class RegressorMixin:
+    """Mixin class for all regression estimators in scikit-learn.
 
-        Examples
-        --------
-        >>> s = pd.Series([1, 2, 3])
-        >>> s.is_unique
-        True
+    This mixin defines the following functionality:
 
-        >>> s = pd.Series([1, 2, 3, 1])
-        >>> s.is_unique
-        False
-        """
-        return self.nunique(dropna=False) == len(self)
+    - set estimator type to `"regressor"` through the `estimator_type` tag;
+    - `score` method that default to :func:`~sklearn.metrics.r2_score`.
+    - enforce that `fit` requires `y` to be passed through the `requires_y` tag,
+      which is done by setting the regressor type tag.
 
-    @property
-    def is_monotonic_increasing(self) -> bool:
-        """
-        Return True if values in the object are monotonically increasing.
+    Read more in the :ref:`User Guide <rolling_your_own_estimator>`.
 
-        Returns
-        -------
-        bool
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, RegressorMixin
+    >>> # Mixin classes should always be on the left-hand side for a correct MRO
+    >>> class MyEstimator(RegressorMixin, BaseEstimator):
+    ...     def __init__(self, *, param=1):
+    ...         self.param = param
+    ...     def fit(self, X, y=None):
+    ...         self.is_fitted_ = True
+    ...         return self
+    ...     def predict(self, X):
+    ...         return np.full(shape=X.shape[0], fill_value=self.param)
+    >>> estimator = MyEstimator(param=0)
+    >>> X = np.array([[1, 2], [2, 3], [3, 4]])
+    >>> y = np.array([-1, 0, 1])
+    >>> estimator.fit(X, y).predict(X)
+    array([0, 0, 0])
+    >>> estimator.score(X, y)
+    0.0
+    """
 
-        See Also
-        --------
-        Series.is_monotonic_decreasing : Return boolean if values in the object are
-            monotonically decreasing.
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "regressor"
+        tags.regressor_tags = RegressorTags()
+        tags.target_tags.required = True
+        return tags
 
-        Examples
-        --------
-        >>> s = pd.Series([1, 2, 2])
-        >>> s.is_monotonic_increasing
-        True
+    def score(self, X, y, sample_weight=None):
+        """Return :ref:`coefficient of determination <r2_score>` on test data.
 
-        >>> s = pd.Series([3, 2, 1])
-        >>> s.is_monotonic_increasing
-        False
-        """
-        from pandas import Index
-
-        return Index(self).is_monotonic_increasing
-
-    @property
-    def is_monotonic_decreasing(self) -> bool:
-        """
-        Return True if values in the object are monotonically decreasing.
-
-        Returns
-        -------
-        bool
-
-        See Also
-        --------
-        Series.is_monotonic_increasing : Return boolean if values in the object are
-            monotonically increasing.
-
-        Examples
-        --------
-        >>> s = pd.Series([3, 2, 2, 1])
-        >>> s.is_monotonic_decreasing
-        True
-
-        >>> s = pd.Series([1, 2, 3])
-        >>> s.is_monotonic_decreasing
-        False
-        """
-        from pandas import Index
-
-        return Index(self).is_monotonic_decreasing
-
-    @final
-    def _memory_usage(self, deep: bool = False) -> int:
-        """
-        Memory usage of the values.
+        The coefficient of determination, :math:`R^2`, is defined as
+        :math:`(1 - \\frac{u}{v})`, where :math:`u` is the residual
+        sum of squares ``((y_true - y_pred)** 2).sum()`` and :math:`v`
+        is the total sum of squares ``((y_true - y_true.mean()) ** 2).sum()``.
+        The best possible score is 1.0 and it can be negative (because the
+        model can be arbitrarily worse). A constant model that always predicts
+        the expected value of `y`, disregarding the input features, would get
+        a :math:`R^2` score of 0.0.
 
         Parameters
         ----------
-        deep : bool, default False
-            Introspect the data deeply, interrogate
-            `object` dtypes for system-level memory consumption.
+        X : array-like of shape (n_samples, n_features)
+            Test samples. For some estimators this may be a precomputed
+            kernel matrix or a list of generic objects instead with shape
+            ``(n_samples, n_samples_fitted)``, where ``n_samples_fitted``
+            is the number of samples used in the fitting for the estimator.
+
+        y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+            True values for `X`.
+
+        sample_weight : array-like of shape (n_samples,), default=None
+            Sample weights.
 
         Returns
         -------
-        bytes used
-            Returns memory usage of the values in the Index in bytes.
-
-        See Also
-        --------
-        numpy.ndarray.nbytes : Total bytes consumed by the elements of the
-            array.
+        score : float
+            :math:`R^2` of ``self.predict(X)`` w.r.t. `y`.
 
         Notes
         -----
-        Memory usage does not include memory consumed by elements that
-        are not components of the array if deep=False or if used on PyPy
-
-        Examples
-        --------
-        >>> idx = pd.Index([1, 2, 3])
-        >>> idx.memory_usage()
-        24
+        The :math:`R^2` score used when calling ``score`` on a regressor uses
+        ``multioutput='uniform_average'`` from version 0.23 to keep consistent
+        with default value of :func:`~sklearn.metrics.r2_score`.
+        This influences the ``score`` method of all the multioutput
+        regressors (except for
+        :class:`~sklearn.multioutput.MultiOutputRegressor`).
         """
-        if hasattr(self.array, "memory_usage"):
-            return self.array.memory_usage(  # pyright: ignore[reportAttributeAccessIssue]
-                deep=deep,
-            )
 
-        v = self.array.nbytes
-        if deep and is_object_dtype(self.dtype) and not PYPY:
-            values = cast(np.ndarray, self._values)
-            v += lib.memory_usage_of_objects(values)
-        return v
+        from sklearn.metrics import r2_score
 
-    def factorize(
-        self,
-        sort: bool = False,
-        use_na_sentinel: bool = True,
-    ) -> tuple[npt.NDArray[np.intp], Index]:
+        y_pred = self.predict(X)
+        return r2_score(y, y_pred, sample_weight=sample_weight)
+
+
+class ClusterMixin:
+    """Mixin class for all cluster estimators in scikit-learn.
+
+    - set estimator type to `"clusterer"` through the `estimator_type` tag;
+    - `fit_predict` method returning the cluster labels associated to each sample.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, ClusterMixin
+    >>> class MyClusterer(ClusterMixin, BaseEstimator):
+    ...     def fit(self, X, y=None):
+    ...         self.labels_ = np.ones(shape=(len(X),), dtype=np.int64)
+    ...         return self
+    >>> X = [[1, 2], [2, 3], [3, 4]]
+    >>> MyClusterer().fit_predict(X)
+    array([1, 1, 1])
+    """
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "clusterer"
+        if tags.transformer_tags is not None:
+            tags.transformer_tags.preserves_dtype = []
+        return tags
+
+    def fit_predict(self, X, y=None, **kwargs):
         """
-        Encode the object as an enumerated type or categorical variable.
-
-        This method is useful for obtaining a numeric representation of an
-        array when all that matters is identifying distinct values. `factorize`
-        is available as both a top-level function :func:`pandas.factorize`,
-        and as a method :meth:`Series.factorize` and :meth:`Index.factorize`.
+        Perform clustering on `X` and returns cluster labels.
 
         Parameters
         ----------
-        sort : bool, default False
-            Sort `uniques` and shuffle `codes` to maintain the
-            relationship.
-        use_na_sentinel : bool, default True
-            If True, the sentinel -1 will be used for NaN values. If False,
-            NaN values will be encoded as non-negative integers and will not drop the
-            NaN from the uniques of the values.
+        X : array-like of shape (n_samples, n_features)
+            Input data.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        **kwargs : dict
+            Arguments to be passed to ``fit``.
+
+            .. versionadded:: 1.4
 
         Returns
         -------
-        codes : ndarray
-            An integer ndarray that's an indexer into `uniques`.
-            ``uniques.take(codes)`` will have the same values as `values`.
-        uniques : ndarray, Index, or Categorical
-            The unique valid values. When `values` is Categorical, `uniques`
-            is a Categorical. When `values` is some other pandas object, an
-            `Index` is returned. Otherwise, a 1-D ndarray is returned.
+        labels : ndarray of shape (n_samples,), dtype=np.int64
+            Cluster labels.
+        """
+        # non-optimized default implementation; override when a better
+        # method is possible for a given clustering algorithm
+        self.fit(X, **kwargs)
+        return self.labels_
 
-            .. note::
 
-                Even if there's a missing value in `values`, `uniques` will
-                *not* contain an entry for it.
+class BiclusterMixin:
+    """Mixin class for all bicluster estimators in scikit-learn.
 
-        See Also
-        --------
-        cut : Discretize continuous-valued array.
-        unique : Find the unique value in an array.
+    This mixin defines the following functionality:
+
+    - `biclusters_` property that returns the row and column indicators;
+    - `get_indices` method that returns the row and column indices of a bicluster;
+    - `get_shape` method that returns the shape of a bicluster;
+    - `get_submatrix` method that returns the submatrix corresponding to a bicluster.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, BiclusterMixin
+    >>> class DummyBiClustering(BiclusterMixin, BaseEstimator):
+    ...     def fit(self, X, y=None):
+    ...         self.rows_ = np.ones(shape=(1, X.shape[0]), dtype=bool)
+    ...         self.columns_ = np.ones(shape=(1, X.shape[1]), dtype=bool)
+    ...         return self
+    >>> X = np.array([[1, 1], [2, 1], [1, 0],
+    ...               [4, 7], [3, 5], [3, 6]])
+    >>> bicluster = DummyBiClustering().fit(X)
+    >>> hasattr(bicluster, "biclusters_")
+    True
+    >>> bicluster.get_indices(0)
+    (array([0, 1, 2, 3, 4, 5]), array([0, 1]))
+    """
+
+    @property
+    def biclusters_(self):
+        """Convenient way to get row and column indicators together.
+
+        Returns the ``rows_`` and ``columns_`` members.
+        """
+        return self.rows_, self.columns_
+
+    def get_indices(self, i):
+        """Row and column indices of the `i`'th bicluster.
+
+        Only works if ``rows_`` and ``columns_`` attributes exist.
+
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+
+        Returns
+        -------
+        row_ind : ndarray, dtype=np.intp
+            Indices of rows in the dataset that belong to the bicluster.
+        col_ind : ndarray, dtype=np.intp
+            Indices of columns in the dataset that belong to the bicluster.
+        """
+        rows = self.rows_[i]
+        columns = self.columns_[i]
+        return np.nonzero(rows)[0], np.nonzero(columns)[0]
+
+    def get_shape(self, i):
+        """Shape of the `i`'th bicluster.
+
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+
+        Returns
+        -------
+        n_rows : int
+            Number of rows in the bicluster.
+
+        n_cols : int
+            Number of columns in the bicluster.
+        """
+        indices = self.get_indices(i)
+        return tuple(len(i) for i in indices)
+
+    def get_submatrix(self, i, data):
+        """Return the submatrix corresponding to bicluster `i`.
+
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+        data : array-like of shape (n_samples, n_features)
+            The data.
+
+        Returns
+        -------
+        submatrix : ndarray of shape (n_rows, n_cols)
+            The submatrix corresponding to bicluster `i`.
 
         Notes
         -----
-        Reference :ref:`the user guide <reshaping.factorize>` for more examples.
-
-        Examples
-        --------
-        These examples all show factorize as a top-level method like
-        ``pd.factorize(values)``. The results are identical for methods like
-        :meth:`Series.factorize`.
-
-        >>> codes, uniques = pd.factorize(
-        ...     np.array(["b", "b", "a", "c", "b"], dtype="O")
-        ... )
-        >>> codes
-        array([0, 0, 1, 2, 0])
-        >>> uniques
-        array(['b', 'a', 'c'], dtype=object)
-
-        With ``sort=True``, the `uniques` will be sorted, and `codes` will be
-        shuffled so that the relationship is the maintained.
-
-        >>> codes, uniques = pd.factorize(
-        ...     np.array(["b", "b", "a", "c", "b"], dtype="O"), sort=True
-        ... )
-        >>> codes
-        array([1, 1, 0, 2, 1])
-        >>> uniques
-        array(['a', 'b', 'c'], dtype=object)
-
-        When ``use_na_sentinel=True`` (the default), missing values are indicated in
-        the `codes` with the sentinel value ``-1`` and missing values are not
-        included in `uniques`.
-
-        >>> codes, uniques = pd.factorize(
-        ...     np.array(["b", None, "a", "c", "b"], dtype="O")
-        ... )
-        >>> codes
-        array([ 0, -1,  1,  2,  0])
-        >>> uniques
-        array(['b', 'a', 'c'], dtype=object)
-
-        Thus far, we've only factorized lists (which are internally coerced to
-        NumPy arrays). When factorizing pandas objects, the type of `uniques`
-        will differ. For Categoricals, a `Categorical` is returned.
-
-        >>> cat = pd.Categorical(["a", "a", "c"], categories=["a", "b", "c"])
-        >>> codes, uniques = pd.factorize(cat)
-        >>> codes
-        array([0, 0, 1])
-        >>> uniques
-        ['a', 'c']
-        Categories (3, str): ['a', 'b', 'c']
-
-        Notice that ``'b'`` is in ``uniques.categories``, despite not being
-        present in ``cat.values``.
-
-        For all other pandas objects, an Index of the appropriate type is
-        returned.
-
-        >>> cat = pd.Series(["a", "a", "c"])
-        >>> codes, uniques = pd.factorize(cat)
-        >>> codes
-        array([0, 0, 1])
-        >>> uniques
-        Index(['a', 'c'], dtype='str')
-
-        If NaN is in the values, and we want to include NaN in the uniques of the
-        values, it can be achieved by setting ``use_na_sentinel=False``.
-
-        >>> values = np.array([1, 2, 1, np.nan])
-        >>> codes, uniques = pd.factorize(values)  # default: use_na_sentinel=True
-        >>> codes
-        array([ 0,  1,  0, -1])
-        >>> uniques
-        array([1., 2.])
-
-        >>> codes, uniques = pd.factorize(values, use_na_sentinel=False)
-        >>> codes
-        array([0, 1, 0, 2])
-        >>> uniques
-        array([ 1.,  2., nan])
+        Works with sparse matrices. Only works if ``rows_`` and
+        ``columns_`` attributes exist.
         """
-        codes, uniques = algorithms.factorize(
-            self._values, sort=sort, use_na_sentinel=use_na_sentinel
-        )
-        if uniques.dtype == np.float16:
-            uniques = uniques.astype(np.float32)
 
-        if isinstance(self, ABCMultiIndex):
-            # preserve MultiIndex
-            if len(self) == 0:
-                # GH#57517
-                uniques = self[:0]
-            else:
-                uniques = self._constructor(uniques)
+        data = check_array(data, accept_sparse="csr")
+        row_ind, col_ind = self.get_indices(i)
+        return data[row_ind[:, np.newaxis], col_ind]
+
+
+class TransformerMixin(_SetOutputMixin):
+    """Mixin class for all transformers in scikit-learn.
+
+    This mixin defines the following functionality:
+
+    - a `fit_transform` method that delegates to `fit` and `transform`;
+    - a `set_output` method to output `X` as a specific container type.
+
+    If :term:`get_feature_names_out` is defined, then :class:`BaseEstimator` will
+    automatically wrap `transform` and `fit_transform` to follow the `set_output`
+    API. See the :ref:`developer_api_set_output` for details.
+
+    :class:`OneToOneFeatureMixin` and
+    :class:`ClassNamePrefixFeaturesOutMixin` are helpful mixins for
+    defining :term:`get_feature_names_out`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, TransformerMixin
+    >>> class MyTransformer(TransformerMixin, BaseEstimator):
+    ...     def __init__(self, *, param=1):
+    ...         self.param = param
+    ...     def fit(self, X, y=None):
+    ...         return self
+    ...     def transform(self, X):
+    ...         return np.full(shape=len(X), fill_value=self.param)
+    >>> transformer = MyTransformer()
+    >>> X = [[1, 2], [2, 3], [3, 4]]
+    >>> transformer.fit_transform(X)
+    array([1, 1, 1])
+    """
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.transformer_tags = TransformerTags()
+        return tags
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """
+        Fit to data, then transform it.
+
+        Fits transformer to `X` and `y` with optional parameters `fit_params`
+        and returns a transformed version of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Input samples.
+
+        y :  array-like of shape (n_samples,) or (n_samples, n_outputs), \
+                default=None
+            Target values (None for unsupervised transformations).
+
+        **fit_params : dict
+            Additional fit parameters.
+            Pass only if the estimator accepts additional params in its `fit` method.
+
+        Returns
+        -------
+        X_new : ndarray array of shape (n_samples, n_features_new)
+            Transformed array.
+        """
+        # non-optimized default implementation; override when a better
+        # method is possible for a given clustering algorithm
+
+        # we do not route parameters here, since consumers don't route. But
+        # since it's possible for a `transform` method to also consume
+        # metadata, we check if that's the case, and we raise a warning telling
+        # users that they should implement a custom `fit_transform` method
+        # to forward metadata to `transform` as well.
+        #
+        # For that, we calculate routing and check if anything would be routed
+        # to `transform` if we were to route them.
+        if _routing_enabled():
+            transform_params = self.get_metadata_routing().consumes(
+                method="transform", params=fit_params.keys()
+            )
+            if transform_params:
+                warnings.warn(
+                    (
+                        f"This object ({self.__class__.__name__}) has a `transform`"
+                        " method which consumes metadata, but `fit_transform` does not"
+                        " forward metadata to `transform`. Please implement a custom"
+                        " `fit_transform` method to forward metadata to `transform` as"
+                        " well. Alternatively, you can explicitly do"
+                        " `set_transform_request`and set all values to `False` to"
+                        " disable metadata routed to `transform`, if that's an option."
+                    ),
+                    UserWarning,
+                )
+
+        if y is None:
+            # fit method of arity 1 (unsupervised transformation)
+            return self.fit(X, **fit_params).transform(X)
         else:
-            from pandas import Index
+            # fit method of arity 2 (supervised transformation)
+            return self.fit(X, y, **fit_params).transform(X)
 
-            try:
-                uniques = Index(uniques, dtype=self.dtype, copy=False)
-            except NotImplementedError:
-                # not all dtypes are supported in Index that are allowed for Series
-                # e.g. float16 or bytes
-                uniques = Index(uniques, copy=False)
-        return codes, uniques
 
-    # This overload is needed so that the call to searchsorted in
-    # pandas.core.resample.TimeGrouper._get_period_bins picks the correct result
+class OneToOneFeatureMixin:
+    """Provides `get_feature_names_out` for simple transformers.
 
-    # error: Overloaded function signatures 1 and 2 overlap with incompatible
-    # return types
-    @overload
-    def searchsorted(  # type: ignore[overload-overlap]
-        self,
-        value: ScalarLike_co,
-        side: Literal["left", "right"] = ...,
-        sorter: NumpySorter = ...,
-    ) -> np.intp: ...
+    This mixin assumes there's a 1-to-1 correspondence between input features
+    and output features, such as :class:`~sklearn.preprocessing.StandardScaler`.
 
-    @overload
-    def searchsorted(
-        self,
-        value: npt.ArrayLike | ExtensionArray,
-        side: Literal["left", "right"] = ...,
-        sorter: NumpySorter = ...,
-    ) -> npt.NDArray[np.intp]: ...
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import OneToOneFeatureMixin, BaseEstimator
+    >>> class MyEstimator(OneToOneFeatureMixin, BaseEstimator):
+    ...     def fit(self, X, y=None):
+    ...         self.n_features_in_ = X.shape[1]
+    ...         return self
+    >>> X = np.array([[1, 2], [3, 4]])
+    >>> MyEstimator().fit(X).get_feature_names_out()
+    array(['x0', 'x1'], dtype=object)
+    """
 
-    def searchsorted(
-        self,
-        value: NumpyValueArrayLike | ExtensionArray,
-        side: Literal["left", "right"] = "left",
-        sorter: NumpySorter | None = None,
-    ) -> npt.NDArray[np.intp] | np.intp:
-        """
-        Find indices where elements should be inserted to maintain order.
-
-        Find the indices into a sorted Index `self` such that, if the
-        corresponding elements in `value` were inserted before the indices,
-        the order of `self` would be preserved.
-
-        .. note::
-
-            The Index *must* be monotonically sorted, otherwise
-            wrong locations will likely be returned. Pandas does *not*
-            check this for you.
+    def get_feature_names_out(self, input_features=None):
+        """Get output feature names for transformation.
 
         Parameters
         ----------
-        value : array-like or scalar
-            Values to insert into `self`.
-        side : {{'left', 'right'}}, optional
-            If 'left', the index of the first suitable location found is given.
-            If 'right', return the last such index.  If there is no suitable
-            index, return either 0 or N (where N is the length of `self`).
-        sorter : 1-D array-like, optional
-            Optional array of integer indices that sort `self` into ascending
-            order. They are typically the result of ``np.argsort``.
+        input_features : array-like of str or None, default=None
+            Input features.
+
+            - If `input_features` is `None`, then `feature_names_in_` is
+              used as feature names in. If `feature_names_in_` is not defined,
+              then the following input feature names are generated:
+              `["x0", "x1", ..., "x(n_features_in_ - 1)"]`.
+            - If `input_features` is an array-like, then `input_features` must
+              match `feature_names_in_` if `feature_names_in_` is defined.
 
         Returns
         -------
-        int or array of int
-            A scalar or array of insertion points with the
-            same shape as `value`.
-
-        See Also
-        --------
-        sort_values : Sort by the values along either axis.
-        numpy.searchsorted : Similar method from NumPy.
-
-        Notes
-        -----
-        Binary search is used to find the required insertion points.
-
-        Examples
-        --------
-        >>> ser = pd.Series([1, 2, 3])
-        >>> ser
-        0    1
-        1    2
-        2    3
-        dtype: int64
-
-        >>> ser.searchsorted(4)
-        np.int64(3)
-
-        >>> ser.searchsorted([0, 4])
-        array([0, 3])
-
-        >>> ser.searchsorted([1, 3], side="left")
-        array([0, 2])
-
-        >>> ser.searchsorted([1, 3], side="right")
-        array([1, 3])
-
-        >>> ser = pd.Series(pd.to_datetime(["3/11/2000", "3/12/2000", "3/13/2000"]))
-        >>> ser
-        0   2000-03-11
-        1   2000-03-12
-        2   2000-03-13
-        dtype: datetime64[us]
-
-        >>> ser.searchsorted("3/14/2000")
-        np.int64(3)
-
-        >>> ser = pd.Categorical(
-        ...     ["apple", "bread", "bread", "cheese", "milk"], ordered=True
-        ... )
-        >>> ser
-        ['apple', 'bread', 'bread', 'cheese', 'milk']
-        Categories (4, str): ['apple' < 'bread' < 'cheese' < 'milk']
-
-        >>> ser.searchsorted("bread")
-        np.int64(1)
-
-        >>> ser.searchsorted(["bread"], side="right")
-        array([3])
-
-        If the values are not monotonically sorted, wrong locations
-        may be returned:
-
-        >>> ser = pd.Series([2, 1, 3])
-        >>> ser
-        0    2
-        1    1
-        2    3
-        dtype: int64
-
-        >>> ser.searchsorted(1)  # doctest: +SKIP
-        0  # wrong result, correct would be 1
+        feature_names_out : ndarray of str objects
+            Same as input features.
         """
-        if isinstance(value, ABCDataFrame):
-            msg = (
-                "Value must be 1-D array-like or scalar, "
-                f"{type(value).__name__} is not supported"
-            )
-            raise ValueError(msg)
+        # Note that passing attributes="n_features_in_" forces check_is_fitted
+        # to check if the attribute is present. Otherwise it will pass on
+        # stateless estimators (requires_fit=False)
+        check_is_fitted(self, attributes="n_features_in_")
+        return _check_feature_names_in(self, input_features)
 
-        values = self._values
-        if not isinstance(values, np.ndarray):
-            # Going through EA.searchsorted directly improves performance GH#38083
-            return values.searchsorted(value, side=side, sorter=sorter)
 
-        return algorithms.searchsorted(
-            values,
-            value,
-            side=side,
-            sorter=sorter,
+class ClassNamePrefixFeaturesOutMixin:
+    """Mixin class for transformers that generate their own names by prefixing.
+
+    This mixin is useful when the transformer needs to generate its own feature
+    names out, such as :class:`~sklearn.decomposition.PCA`. For example, if
+    :class:`~sklearn.decomposition.PCA` outputs 3 features, then the generated feature
+    names out are: `["pca0", "pca1", "pca2"]`.
+
+    This mixin assumes that a `_n_features_out` attribute is defined when the
+    transformer is fitted. `_n_features_out` is the number of output features
+    that the transformer will return in `transform` of `fit_transform`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import ClassNamePrefixFeaturesOutMixin, BaseEstimator
+    >>> class MyEstimator(ClassNamePrefixFeaturesOutMixin, BaseEstimator):
+    ...     def fit(self, X, y=None):
+    ...         self._n_features_out = X.shape[1]
+    ...         return self
+    >>> X = np.array([[1, 2], [3, 4]])
+    >>> MyEstimator().fit(X).get_feature_names_out()
+    array(['myestimator0', 'myestimator1'], dtype=object)
+    """
+
+    def get_feature_names_out(self, input_features=None):
+        """Get output feature names for transformation.
+
+        The feature names out will prefixed by the lowercased class name. For
+        example, if the transformer outputs 3 features, then the feature names
+        out are: `["class_name0", "class_name1", "class_name2"]`.
+
+        Parameters
+        ----------
+        input_features : array-like of str or None, default=None
+            Only used to validate feature names with the names seen in `fit`.
+
+        Returns
+        -------
+        feature_names_out : ndarray of str objects
+            Transformed feature names.
+        """
+        check_is_fitted(self, "_n_features_out")
+        return _generate_get_feature_names_out(
+            self, self._n_features_out, input_features=input_features
         )
 
-    def drop_duplicates(self, *, keep: DropKeep = "first") -> Self:
-        duplicated = self._duplicated(keep=keep)
-        # error: Value of type "IndexOpsMixin" is not indexable
-        return self[~duplicated]  # type: ignore[index]
 
-    @final
-    def _duplicated(self, keep: DropKeep = "first") -> npt.NDArray[np.bool_]:
-        arr = self._values
-        if isinstance(arr, ExtensionArray):
-            return arr.duplicated(keep=keep)
-        return algorithms.duplicated(arr, keep=keep)
+class DensityMixin:
+    """Mixin class for all density estimators in scikit-learn.
 
-    def _arith_method(self, other, op):
-        res_name = ops.get_op_result_name(self, other)
+    This mixin defines the following functionality:
 
-        lvalues = self._values
-        rvalues = extract_array(other, extract_numpy=True, extract_range=True)
-        rvalues = ops.maybe_prepare_scalar_for_op(rvalues, lvalues.shape)
-        rvalues = ensure_wrapped_if_datetimelike(rvalues)
-        if isinstance(rvalues, range):
-            rvalues = np.arange(rvalues.start, rvalues.stop, rvalues.step)
+    - sets estimator type to `"density_estimator"` through the `estimator_type` tag;
+    - `score` method that default that do no-op.
 
-        with np.errstate(all="ignore"):
-            result = ops.arithmetic_op(lvalues, rvalues, op)
+    Examples
+    --------
+    >>> from sklearn.base import DensityMixin
+    >>> class MyEstimator(DensityMixin):
+    ...     def fit(self, X, y=None):
+    ...         self.is_fitted_ = True
+    ...         return self
+    >>> estimator = MyEstimator()
+    >>> hasattr(estimator, "score")
+    True
+    """
 
-        return self._construct_result(result, name=res_name, other=other)
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "density_estimator"
+        return tags
 
-    def _construct_result(self, result, name, other):
+    def score(self, X, y=None):
+        """Return the score of the model on the data `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Test samples.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        Returns
+        -------
+        score : float
         """
-        Construct an appropriately-wrapped result from the ArrayLike result
-        of an arithmetic-like operation.
+        pass
+
+
+class OutlierMixin:
+    """Mixin class for all outlier detection estimators in scikit-learn.
+
+    This mixin defines the following functionality:
+
+    - set estimator type to `"outlier_detector"` through the `estimator_type` tag;
+    - `fit_predict` method that default to `fit` and `predict`.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from sklearn.base import BaseEstimator, OutlierMixin
+    >>> class MyEstimator(OutlierMixin):
+    ...     def fit(self, X, y=None):
+    ...         self.is_fitted_ = True
+    ...         return self
+    ...     def predict(self, X):
+    ...         return np.ones(shape=len(X))
+    >>> estimator = MyEstimator()
+    >>> X = np.array([[1, 2], [2, 3], [3, 4]])
+    >>> estimator.fit_predict(X)
+    array([1., 1., 1.])
+    """
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.estimator_type = "outlier_detector"
+        return tags
+
+    def fit_predict(self, X, y=None, **kwargs):
+        """Perform fit on X and returns labels for X.
+
+        Returns -1 for outliers and 1 for inliers.
+
+        Parameters
+        ----------
+        X : {array-like, sparse matrix} of shape (n_samples, n_features)
+            The input samples.
+
+        y : Ignored
+            Not used, present for API consistency by convention.
+
+        **kwargs : dict
+            Arguments to be passed to ``fit``.
+
+            .. versionadded:: 1.4
+
+        Returns
+        -------
+        y : ndarray of shape (n_samples,)
+            1 for inliers, -1 for outliers.
         """
-        raise AbstractMethodError(self)
+        # we do not route parameters here, since consumers don't route. But
+        # since it's possible for a `predict` method to also consume
+        # metadata, we check if that's the case, and we raise a warning telling
+        # users that they should implement a custom `fit_predict` method
+        # to forward metadata to `predict` as well.
+        #
+        # For that, we calculate routing and check if anything would be routed
+        # to `predict` if we were to route them.
+        if _routing_enabled():
+            transform_params = self.get_metadata_routing().consumes(
+                method="predict", params=kwargs.keys()
+            )
+            if transform_params:
+                warnings.warn(
+                    (
+                        f"This object ({self.__class__.__name__}) has a `predict` "
+                        "method which consumes metadata, but `fit_predict` does not "
+                        "forward metadata to `predict`. Please implement a custom "
+                        "`fit_predict` method to forward metadata to `predict` as well."
+                        "Alternatively, you can explicitly do `set_predict_request`"
+                        "and set all values to `False` to disable metadata routed to "
+                        "`predict`, if that's an option."
+                    ),
+                    UserWarning,
+                )
+
+        # override for transductive outlier detectors like LocalOulierFactor
+        return self.fit(X, **kwargs).predict(X)
+
+
+class MetaEstimatorMixin:
+    """Mixin class for all meta estimators in scikit-learn.
+
+    This mixin is empty, and only exists to indicate that the estimator is a
+    meta-estimator.
+
+    .. versionchanged:: 1.6
+        The `_required_parameters` is now removed and is unnecessary since tests are
+        refactored and don't use this anymore.
+
+    Examples
+    --------
+    >>> from sklearn.base import MetaEstimatorMixin
+    >>> from sklearn.datasets import load_iris
+    >>> from sklearn.linear_model import LogisticRegression
+    >>> class MyEstimator(MetaEstimatorMixin):
+    ...     def __init__(self, *, estimator=None):
+    ...         self.estimator = estimator
+    ...     def fit(self, X, y=None):
+    ...         if self.estimator is None:
+    ...             self.estimator_ = LogisticRegression()
+    ...         else:
+    ...             self.estimator_ = self.estimator
+    ...         return self
+    >>> X, y = load_iris(return_X_y=True)
+    >>> estimator = MyEstimator().fit(X, y)
+    >>> estimator.estimator_
+    LogisticRegression()
+    """
+
+
+class MultiOutputMixin:
+    """Mixin to mark estimators that support multioutput."""
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.target_tags.multi_output = True
+        return tags
+
+
+class _UnstableArchMixin:
+    """Mark estimators that are non-determinstic on 32bit or PowerPC"""
+
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.non_deterministic = _IS_32BIT or platform.machine().startswith(
+            ("ppc", "powerpc")
+        )
+        return tags
+
+
+def is_classifier(estimator):
+    """Return True if the given estimator is (probably) a classifier.
+
+    Parameters
+    ----------
+    estimator : estimator instance
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is a classifier and False otherwise.
+
+    Examples
+    --------
+    >>> from sklearn.base import is_classifier
+    >>> from sklearn.cluster import KMeans
+    >>> from sklearn.svm import SVC, SVR
+    >>> classifier = SVC()
+    >>> regressor = SVR()
+    >>> kmeans = KMeans()
+    >>> is_classifier(classifier)
+    True
+    >>> is_classifier(regressor)
+    False
+    >>> is_classifier(kmeans)
+    False
+    """
+    return get_tags(estimator).estimator_type == "classifier"
+
+
+def is_regressor(estimator):
+    """Return True if the given estimator is (probably) a regressor.
+
+    Parameters
+    ----------
+    estimator : estimator instance
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is a regressor and False otherwise.
+
+    Examples
+    --------
+    >>> from sklearn.base import is_regressor
+    >>> from sklearn.cluster import KMeans
+    >>> from sklearn.svm import SVC, SVR
+    >>> classifier = SVC()
+    >>> regressor = SVR()
+    >>> kmeans = KMeans()
+    >>> is_regressor(classifier)
+    False
+    >>> is_regressor(regressor)
+    True
+    >>> is_regressor(kmeans)
+    False
+    """
+    return get_tags(estimator).estimator_type == "regressor"
+
+
+def is_clusterer(estimator):
+    """Return True if the given estimator is (probably) a clusterer.
+
+    .. versionadded:: 1.6
+
+    Parameters
+    ----------
+    estimator : estimator instance
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is a clusterer and False otherwise.
+
+    Examples
+    --------
+    >>> from sklearn.base import is_clusterer
+    >>> from sklearn.cluster import KMeans
+    >>> from sklearn.svm import SVC, SVR
+    >>> classifier = SVC()
+    >>> regressor = SVR()
+    >>> kmeans = KMeans()
+    >>> is_clusterer(classifier)
+    False
+    >>> is_clusterer(regressor)
+    False
+    >>> is_clusterer(kmeans)
+    True
+    """
+    return get_tags(estimator).estimator_type == "clusterer"
+
+
+def is_outlier_detector(estimator):
+    """Return True if the given estimator is (probably) an outlier detector.
+
+    Parameters
+    ----------
+    estimator : estimator instance
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is an outlier detector and False otherwise.
+    """
+    return get_tags(estimator).estimator_type == "outlier_detector"
+
+
+def _fit_context(*, prefer_skip_nested_validation):
+    """Decorator to run the fit methods of estimators within context managers.
+
+    Parameters
+    ----------
+    prefer_skip_nested_validation : bool
+        If True, the validation of parameters of inner estimators or functions
+        called during fit will be skipped.
+
+        This is useful to avoid validating many times the parameters passed by the
+        user from the public facing API. It's also useful to avoid validating
+        parameters that we pass internally to inner functions that are guaranteed to
+        be valid by the test suite.
+
+        It should be set to True for most estimators, except for those that receive
+        non-validated objects as parameters, such as meta-estimators that are given
+        estimator objects.
+
+    Returns
+    -------
+    decorated_fit : method
+        The decorated fit method.
+    """
+
+    def decorator(fit_method):
+        @functools.wraps(fit_method)
+        def wrapper(estimator, *args, **kwargs):
+            global_skip_validation = get_config()["skip_parameter_validation"]
+
+            # we don't want to validate again for each call to partial_fit
+            partial_fit_and_fitted = (
+                fit_method.__name__ == "partial_fit" and _is_fitted(estimator)
+            )
+
+            if not global_skip_validation and not partial_fit_and_fitted:
+                estimator._validate_params()
+
+            with config_context(
+                skip_parameter_validation=(
+                    prefer_skip_nested_validation or global_skip_validation
+                )
+            ):
+                return fit_method(estimator, *args, **kwargs)
+
+        return wrapper
+
+    return decorator

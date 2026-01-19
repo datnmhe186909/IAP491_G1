@@ -1,265 +1,249 @@
-"""
-Global Django exception classes.
-"""
+"""Custom warnings and errors used across scikit-learn."""
 
-import operator
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
-from django.utils.hashable import make_hashable
-
-
-class FieldDoesNotExist(Exception):
-    """The requested model field does not exist"""
-
-    pass
-
-
-class AppRegistryNotReady(Exception):
-    """The django.apps registry is not populated yet"""
-
-    pass
-
-
-class ObjectDoesNotExist(Exception):
-    """The requested object does not exist"""
-
-    silent_variable_failure = True
+__all__ = [
+    "ConvergenceWarning",
+    "DataConversionWarning",
+    "DataDimensionalityWarning",
+    "EfficiencyWarning",
+    "EstimatorCheckFailedWarning",
+    "FitFailedWarning",
+    "NotFittedError",
+    "PositiveSpectrumWarning",
+    "SkipTestWarning",
+    "UndefinedMetricWarning",
+    "UnsetMetadataPassedError",
+]
 
 
-class ObjectNotUpdated(Exception):
-    """The updated object no longer exists."""
+class UnsetMetadataPassedError(ValueError):
+    """Exception class to raise if a metadata is passed which is not explicitly \
+        requested (metadata=True) or not requested (metadata=False).
 
+    .. versionadded:: 1.3
 
-class MultipleObjectsReturned(Exception):
-    """The query returned multiple objects when only one was expected."""
+    Parameters
+    ----------
+    message : str
+        The message
 
-    pass
+    unrequested_params : dict
+        A dictionary of parameters and their values which are provided but not
+        requested.
 
-
-class SuspiciousOperation(Exception):
-    """The user did something suspicious"""
-
-
-class SuspiciousMultipartForm(SuspiciousOperation):
-    """Suspect MIME request in multipart form data"""
-
-    pass
-
-
-class SuspiciousFileOperation(SuspiciousOperation):
-    """A Suspicious filesystem operation was attempted"""
-
-    pass
-
-
-class DisallowedHost(SuspiciousOperation):
-    """HTTP_HOST header contains invalid value"""
-
-    pass
-
-
-class DisallowedRedirect(SuspiciousOperation):
-    """Redirect was too long or scheme was not in allowed list."""
-
-    pass
-
-
-class TooManyFieldsSent(SuspiciousOperation):
-    """
-    The number of fields in a GET or POST request exceeded
-    settings.DATA_UPLOAD_MAX_NUMBER_FIELDS.
+    routed_params : dict
+        A dictionary of routed parameters.
     """
 
-    pass
+    def __init__(self, *, message, unrequested_params, routed_params):
+        super().__init__(message)
+        self.unrequested_params = unrequested_params
+        self.routed_params = routed_params
 
 
-class TooManyFilesSent(SuspiciousOperation):
+class NotFittedError(ValueError, AttributeError):
+    """Exception class to raise if estimator is used before fitting.
+
+    This class inherits from both ValueError and AttributeError to help with
+    exception handling and backward compatibility.
+
+    Examples
+    --------
+    >>> from sklearn.svm import LinearSVC
+    >>> from sklearn.exceptions import NotFittedError
+    >>> try:
+    ...     LinearSVC().predict([[1, 2], [2, 3], [3, 4]])
+    ... except NotFittedError as e:
+    ...     print(repr(e))
+    NotFittedError("This LinearSVC instance is not fitted yet. Call 'fit' with
+    appropriate arguments before using this estimator."...)
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.validation.
     """
-    The number of fields in a GET or POST request exceeded
-    settings.DATA_UPLOAD_MAX_NUMBER_FILES.
+
+
+class ConvergenceWarning(UserWarning):
+    """Custom warning to capture convergence problems
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.
     """
 
-    pass
 
+class DataConversionWarning(UserWarning):
+    """Warning used to notify implicit data conversions happening in the code.
 
-class RequestDataTooBig(SuspiciousOperation):
+    This warning occurs when some input data needs to be converted or
+    interpreted in a way that may not match the user's expectations.
+
+    For example, this warning may occur when the user
+        - passes an integer array to a function which expects float input and
+          will convert the input
+        - requests a non-copying operation, but a copy is required to meet the
+          implementation's data-type expectations;
+        - passes an input whose shape can be interpreted ambiguously.
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.validation.
     """
-    The size of the request (excluding any file uploads) exceeded
-    settings.DATA_UPLOAD_MAX_MEMORY_SIZE.
+
+
+class DataDimensionalityWarning(UserWarning):
+    """Custom warning to notify potential issues with data dimensionality.
+
+    For example, in random projection, this warning is raised when the
+    number of components, which quantifies the dimensionality of the target
+    projection space, is higher than the number of features, which quantifies
+    the dimensionality of the original source space, to imply that the
+    dimensionality of the problem will not be reduced.
+
+    .. versionchanged:: 0.18
+       Moved from sklearn.utils.
     """
 
-    pass
+
+class EfficiencyWarning(UserWarning):
+    """Warning used to notify the user of inefficient computation.
+
+    This warning notifies the user that the efficiency may not be optimal due
+    to some reason which may be included as a part of the warning message.
+    This may be subclassed into a more specific Warning class.
+
+    .. versionadded:: 0.18
+    """
 
 
-class RequestAborted(Exception):
-    """The request was closed before it was completed, or timed out."""
+class FitFailedWarning(RuntimeWarning):
+    """Warning class used if there is an error while fitting the estimator.
 
-    pass
+    This Warning is used in meta estimators GridSearchCV and RandomizedSearchCV
+    and the cross-validation helper function cross_val_score to warn when there
+    is an error while fitting the estimator.
 
-
-class BadRequest(Exception):
-    """The request is malformed and cannot be processed."""
-
-    pass
-
-
-class PermissionDenied(Exception):
-    """The user did not have permission to do that"""
-
-    pass
+    .. versionchanged:: 0.18
+       Moved from sklearn.cross_validation.
+    """
 
 
-class ViewDoesNotExist(Exception):
-    """The requested view does not exist"""
+class SkipTestWarning(UserWarning):
+    """Warning class used to notify the user of a test that was skipped.
 
-    pass
-
-
-class MiddlewareNotUsed(Exception):
-    """This middleware is not used in this server configuration"""
-
-    pass
+    For example, one of the estimator checks requires a pandas import.
+    If the pandas package cannot be imported, the test will be skipped rather
+    than register as a failure.
+    """
 
 
-class ImproperlyConfigured(Exception):
-    """Django is somehow improperly configured"""
+class UndefinedMetricWarning(UserWarning):
+    """Warning used when the metric is invalid
 
-    pass
-
-
-class FieldError(Exception):
-    """Some kind of problem with a model field."""
-
-    pass
+    .. versionchanged:: 0.18
+       Moved from sklearn.base.
+    """
 
 
-class FieldFetchBlocked(FieldError):
-    """On-demand fetching of a model field blocked."""
+class PositiveSpectrumWarning(UserWarning):
+    """Warning raised when the eigenvalues of a PSD matrix have issues
 
-    pass
+    This warning is typically raised by ``_check_psd_eigenvalues`` when the
+    eigenvalues of a positive semidefinite (PSD) matrix such as a gram matrix
+    (kernel) present significant negative eigenvalues, or bad conditioning i.e.
+    very small non-zero eigenvalues compared to the largest eigenvalue.
+
+    .. versionadded:: 0.22
+    """
 
 
-NON_FIELD_ERRORS = "__all__"
+class InconsistentVersionWarning(UserWarning):
+    """Warning raised when an estimator is unpickled with an inconsistent version.
 
+    Parameters
+    ----------
+    estimator_name : str
+        Estimator name.
 
-class ValidationError(Exception):
-    """An error while validating data."""
+    current_sklearn_version : str
+        Current scikit-learn version.
 
-    def __init__(self, message, code=None, params=None):
-        """
-        The `message` argument can be a single error, a list of errors, or a
-        dictionary that maps field names to lists of errors. What we define as
-        an "error" can be either a simple string or an instance of
-        ValidationError with its message attribute set, and what we define as
-        list or dictionary can be an actual `list` or `dict` or an instance
-        of ValidationError with its `error_list` or `error_dict` attribute set.
-        """
-        super().__init__(message, code, params)
+    original_sklearn_version : str
+        Original scikit-learn version.
+    """
 
-        if isinstance(message, ValidationError):
-            if hasattr(message, "error_dict"):
-                message = message.error_dict
-            elif not hasattr(message, "message"):
-                message = message.error_list
-            else:
-                message, code, params = message.message, message.code, message.params
-
-        if isinstance(message, dict):
-            self.error_dict = {}
-            for field, messages in message.items():
-                if not isinstance(messages, ValidationError):
-                    messages = ValidationError(messages)
-                self.error_dict[field] = messages.error_list
-
-        elif isinstance(message, list):
-            self.error_list = []
-            for message in message:
-                # Normalize plain strings to instances of ValidationError.
-                if not isinstance(message, ValidationError):
-                    message = ValidationError(message)
-                if hasattr(message, "error_dict"):
-                    self.error_list.extend(sum(message.error_dict.values(), []))
-                else:
-                    self.error_list.extend(message.error_list)
-
-        else:
-            self.message = message
-            self.code = code
-            self.params = params
-            self.error_list = [self]
-
-    @property
-    def message_dict(self):
-        # Trigger an AttributeError if this ValidationError
-        # doesn't have an error_dict.
-        getattr(self, "error_dict")
-
-        return dict(self)
-
-    @property
-    def messages(self):
-        if hasattr(self, "error_dict"):
-            return sum(dict(self).values(), [])
-        return list(self)
-
-    def update_error_dict(self, error_dict):
-        if hasattr(self, "error_dict"):
-            for field, error_list in self.error_dict.items():
-                error_dict.setdefault(field, []).extend(error_list)
-        else:
-            error_dict.setdefault(NON_FIELD_ERRORS, []).extend(self.error_list)
-        return error_dict
-
-    def __iter__(self):
-        if hasattr(self, "error_dict"):
-            for field, errors in self.error_dict.items():
-                yield field, list(ValidationError(errors))
-        else:
-            for error in self.error_list:
-                message = error.message
-                if error.params:
-                    message %= error.params
-                yield str(message)
+    def __init__(
+        self, *, estimator_name, current_sklearn_version, original_sklearn_version
+    ):
+        self.estimator_name = estimator_name
+        self.current_sklearn_version = current_sklearn_version
+        self.original_sklearn_version = original_sklearn_version
 
     def __str__(self):
-        if hasattr(self, "error_dict"):
-            return repr(dict(self))
-        return repr(list(self))
+        return (
+            f"Trying to unpickle estimator {self.estimator_name} from version"
+            f" {self.original_sklearn_version} when "
+            f"using version {self.current_sklearn_version}. This might lead to breaking"
+            " code or "
+            "invalid results. Use at your own risk. "
+            "For more info please refer to:\n"
+            "https://scikit-learn.org/stable/model_persistence.html"
+            "#security-maintainability-limitations"
+        )
+
+
+class EstimatorCheckFailedWarning(UserWarning):
+    """Warning raised when an estimator check from the common tests fails.
+
+    Parameters
+    ----------
+    estimator : estimator object
+        Estimator instance for which the test failed.
+
+    check_name : str
+        Name of the check that failed.
+
+    exception : Exception
+        Exception raised by the failed check.
+
+    status : str
+        Status of the check.
+
+    expected_to_fail : bool
+        Whether the check was expected to fail.
+
+    expected_to_fail_reason : str
+        Reason for the expected failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        estimator,
+        check_name: str,
+        exception: Exception,
+        status: str,
+        expected_to_fail: bool,
+        expected_to_fail_reason: str,
+    ):
+        self.estimator = estimator
+        self.check_name = check_name
+        self.exception = exception
+        self.status = status
+        self.expected_to_fail = expected_to_fail
+        self.expected_to_fail_reason = expected_to_fail_reason
 
     def __repr__(self):
-        return "ValidationError(%s)" % self
+        expected_to_fail_str = (
+            f"Expected to fail: {self.expected_to_fail_reason}"
+            if self.expected_to_fail
+            else "Not expected to fail"
+        )
+        return (
+            f"Test {self.check_name} failed for estimator {self.estimator!r}.\n"
+            f"Expected to fail reason: {expected_to_fail_str}\n"
+            f"Exception: {self.exception}"
+        )
 
-    def __eq__(self, other):
-        if not isinstance(other, ValidationError):
-            return NotImplemented
-        return hash(self) == hash(other)
-
-    def __hash__(self):
-        if hasattr(self, "message"):
-            return hash(
-                (
-                    self.message,
-                    self.code,
-                    make_hashable(self.params),
-                )
-            )
-        if hasattr(self, "error_dict"):
-            return hash(make_hashable(self.error_dict))
-        return hash(tuple(sorted(self.error_list, key=operator.attrgetter("message"))))
-
-
-class EmptyResultSet(Exception):
-    """A database query predicate is impossible."""
-
-    pass
-
-
-class FullResultSet(Exception):
-    """A database query predicate is matches everything."""
-
-    pass
-
-
-class SynchronousOnlyOperation(Exception):
-    """The user tried to call a sync-only function from an async context."""
-
-    pass
+    def __str__(self):
+        return self.__repr__()
