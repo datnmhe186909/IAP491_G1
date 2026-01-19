@@ -1,13 +1,15 @@
-# ruff: noqa: TC004
-from typing import TYPE_CHECKING
+from pandas.io.json._json import (
+    read_json,
+    to_json,
+    ujson_dumps,
+    ujson_loads,
+)
+from pandas.io.json._table_schema import build_table_schema
 
-if TYPE_CHECKING:
-    # import modules that have public classes/functions
-    from pandas.io import (
-        formats,
-        json,
-        stata,
-    )
-
-    # mark only those modules as public
-    __all__ = ["formats", "json", "stata"]
+__all__ = [
+    "build_table_schema",
+    "read_json",
+    "to_json",
+    "ujson_dumps",
+    "ujson_loads",
+]
