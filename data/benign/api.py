@@ -1,138 +1,65 @@
-from pandas._libs import (
-    NaT,
-    Period,
-    Timedelta,
-    Timestamp,
-)
-from pandas._libs.missing import NA
+"""
+Data I/O API
+"""
 
-from pandas.core.dtypes.dtypes import (
-    ArrowDtype,
-    CategoricalDtype,
-    DatetimeTZDtype,
-    IntervalDtype,
-    PeriodDtype,
+from pandas.io.clipboards import read_clipboard
+from pandas.io.excel import (
+    ExcelFile,
+    ExcelWriter,
+    read_excel,
 )
-from pandas.core.dtypes.missing import (
-    isna,
-    isnull,
-    notna,
-    notnull,
+from pandas.io.feather_format import read_feather
+from pandas.io.html import read_html
+from pandas.io.iceberg import read_iceberg
+from pandas.io.json import read_json
+from pandas.io.orc import read_orc
+from pandas.io.parquet import read_parquet
+from pandas.io.parsers import (
+    read_csv,
+    read_fwf,
+    read_table,
 )
-
-from pandas.core.algorithms import (
-    factorize,
-    unique,
+from pandas.io.pickle import (
+    read_pickle,
+    to_pickle,
 )
-from pandas.core.arrays import Categorical
-from pandas.core.arrays.boolean import BooleanDtype
-from pandas.core.arrays.floating import (
-    Float32Dtype,
-    Float64Dtype,
+from pandas.io.pytables import (
+    HDFStore,
+    read_hdf,
 )
-from pandas.core.arrays.integer import (
-    Int8Dtype,
-    Int16Dtype,
-    Int32Dtype,
-    Int64Dtype,
-    UInt8Dtype,
-    UInt16Dtype,
-    UInt32Dtype,
-    UInt64Dtype,
+from pandas.io.sas import read_sas
+from pandas.io.spss import read_spss
+from pandas.io.sql import (
+    read_sql,
+    read_sql_query,
+    read_sql_table,
 )
-from pandas.core.arrays.string_ import StringDtype
-from pandas.core.construction import array  # noqa: ICN001
-from pandas.core.flags import Flags
-from pandas.core.groupby import (
-    Grouper,
-    NamedAgg,
-)
-from pandas.core.indexes.api import (
-    CategoricalIndex,
-    DatetimeIndex,
-    Index,
-    IntervalIndex,
-    MultiIndex,
-    PeriodIndex,
-    RangeIndex,
-    TimedeltaIndex,
-)
-from pandas.core.indexes.datetimes import (
-    bdate_range,
-    date_range,
-)
-from pandas.core.indexes.interval import (
-    Interval,
-    interval_range,
-)
-from pandas.core.indexes.period import period_range
-from pandas.core.indexes.timedeltas import timedelta_range
-from pandas.core.indexing import IndexSlice
-from pandas.core.series import Series
-from pandas.core.tools.datetimes import to_datetime
-from pandas.core.tools.numeric import to_numeric
-from pandas.core.tools.timedeltas import to_timedelta
-
-from pandas.io.formats.format import set_eng_float_format
-from pandas.tseries.offsets import DateOffset
-
-# DataFrame needs to be imported after NamedAgg to avoid a circular import
-from pandas.core.frame import DataFrame  # isort:skip
+from pandas.io.stata import read_stata
+from pandas.io.xml import read_xml
 
 __all__ = [
-    "NA",
-    "ArrowDtype",
-    "BooleanDtype",
-    "Categorical",
-    "CategoricalDtype",
-    "CategoricalIndex",
-    "DataFrame",
-    "DateOffset",
-    "DatetimeIndex",
-    "DatetimeTZDtype",
-    "Flags",
-    "Float32Dtype",
-    "Float64Dtype",
-    "Grouper",
-    "Index",
-    "IndexSlice",
-    "Int8Dtype",
-    "Int16Dtype",
-    "Int32Dtype",
-    "Int64Dtype",
-    "Interval",
-    "IntervalDtype",
-    "IntervalIndex",
-    "MultiIndex",
-    "NaT",
-    "NamedAgg",
-    "Period",
-    "PeriodDtype",
-    "PeriodIndex",
-    "RangeIndex",
-    "Series",
-    "StringDtype",
-    "Timedelta",
-    "TimedeltaIndex",
-    "Timestamp",
-    "UInt8Dtype",
-    "UInt16Dtype",
-    "UInt32Dtype",
-    "UInt64Dtype",
-    "array",
-    "bdate_range",
-    "date_range",
-    "factorize",
-    "interval_range",
-    "isna",
-    "isnull",
-    "notna",
-    "notnull",
-    "period_range",
-    "set_eng_float_format",
-    "timedelta_range",
-    "to_datetime",
-    "to_numeric",
-    "to_timedelta",
-    "unique",
+    "ExcelFile",
+    "ExcelWriter",
+    "HDFStore",
+    "read_clipboard",
+    "read_csv",
+    "read_excel",
+    "read_feather",
+    "read_fwf",
+    "read_hdf",
+    "read_html",
+    "read_iceberg",
+    "read_json",
+    "read_orc",
+    "read_parquet",
+    "read_pickle",
+    "read_sas",
+    "read_spss",
+    "read_sql",
+    "read_sql_query",
+    "read_sql_table",
+    "read_stata",
+    "read_table",
+    "read_xml",
+    "to_pickle",
 ]
