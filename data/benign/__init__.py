@@ -1,406 +1,321 @@
-"""Beautiful Soup
-Elixir and Tonic
-"The Screen-Scraper's Friend"
-http://www.crummy.com/software/BeautifulSoup/
-
-Beautiful Soup uses a pluggable XML or HTML parser to parse a
-(possibly invalid) document into a tree representation. Beautiful Soup
-provides provides methods and Pythonic idioms that make it easy to
-navigate, search, and modify the parse tree.
-
-Beautiful Soup works with Python 2.6 and up. It works better if lxml
-and/or html5lib is installed.
-
-For more than you ever wanted to know about Beautiful Soup, see the
-documentation:
-http://www.crummy.com/software/BeautifulSoup/bs4/doc/
-"""
-
-__author__ = "Leonard Richardson (leonardr@segfault.org)"
-__version__ = "4.3.2"
-__copyright__ = "Copyright (c) 2004-2013 Leonard Richardson"
-__license__ = "MIT"
-
-__all__ = ['BeautifulSoup']
-
-import os
-import re
-import warnings
-
-from .builder import builder_registry, ParserRejectedMarkup
-from .dammit import UnicodeDammit
-from .element import (
-    CData,
-    Comment,
-    DEFAULT_OUTPUT_ENCODING,
-    Declaration,
-    Doctype,
-    NavigableString,
-    PageElement,
-    ProcessingInstruction,
-    ResultSet,
-    SoupStrainer,
-    Tag,
+from collections import defaultdict
+import itertools
+import sys
+from bs4.element import (
+    CharsetMetaAttributeValue,
+    ContentMetaAttributeValue,
+    whitespace_re
     )
 
-# The very first thing we do is give a useful error if someone is
-# running this code under Python 3 without converting it.
-syntax_error = u'You are trying to run the Python 2 version of Beautiful Soup under Python 3. This will not work. You need to convert the code, either by installing it (`python setup.py install`) or by running 2to3 (`2to3 -w bs4`).'
+__all__ = [
+    'HTMLTreeBuilder',
+    'SAXTreeBuilder',
+    'TreeBuilder',
+    'TreeBuilderRegistry',
+    ]
 
-class BeautifulSoup(Tag):
-    """
-    This class defines the basic interface called by the tree builders.
+# Some useful features for a TreeBuilder to have.
+FAST = 'fast'
+PERMISSIVE = 'permissive'
+STRICT = 'strict'
+XML = 'xml'
+HTML = 'html'
+HTML_5 = 'html5'
 
-    These methods will be called by the parser:
-      reset()
-      feed(markup)
 
-    The tree builder may call these methods from its feed() implementation:
-      handle_starttag(name, attrs) # See note about return value
-      handle_endtag(name)
-      handle_data(data) # Appends to the current data node
-      endData(containerClass=NavigableString) # Ends the current data node
+class TreeBuilderRegistry(object):
 
-    No matter how complicated the underlying parser is, you should be
-    able to build a tree using 'start tag' events, 'end tag' events,
-    'data' events, and "done with data" events.
+    def __init__(self):
+        self.builders_for_feature = defaultdict(list)
+        self.builders = []
 
-    If you encounter an empty-element tag (aka a self-closing tag,
-    like HTML's <br> tag), call handle_starttag and then
-    handle_endtag.
-    """
-    ROOT_TAG_NAME = u'[document]'
+    def register(self, treebuilder_class):
+        """Register a treebuilder based on its advertised features."""
+        for feature in treebuilder_class.features:
+            self.builders_for_feature[feature].insert(0, treebuilder_class)
+        self.builders.insert(0, treebuilder_class)
 
-    # If the end-user gives no indication which tree builder they
-    # want, look for one with these features.
-    DEFAULT_BUILDER_FEATURES = ['html', 'fast']
-
-    ASCII_SPACES = '\x20\x0a\x09\x0c\x0d'
-
-    def __init__(self, markup="", features=None, builder=None,
-                 parse_only=None, from_encoding=None, **kwargs):
-        """The Soup object is initialized as the 'root tag', and the
-        provided markup (which can be a string or a file-like object)
-        is fed into the underlying parser."""
-
-        if 'convertEntities' in kwargs:
-            warnings.warn(
-                "BS4 does not respect the convertEntities argument to the "
-                "BeautifulSoup constructor. Entities are always converted "
-                "to Unicode characters.")
-
-        if 'markupMassage' in kwargs:
-            del kwargs['markupMassage']
-            warnings.warn(
-                "BS4 does not respect the markupMassage argument to the "
-                "BeautifulSoup constructor. The tree builder is responsible "
-                "for any necessary markup massage.")
-
-        if 'smartQuotesTo' in kwargs:
-            del kwargs['smartQuotesTo']
-            warnings.warn(
-                "BS4 does not respect the smartQuotesTo argument to the "
-                "BeautifulSoup constructor. Smart quotes are always converted "
-                "to Unicode characters.")
-
-        if 'selfClosingTags' in kwargs:
-            del kwargs['selfClosingTags']
-            warnings.warn(
-                "BS4 does not respect the selfClosingTags argument to the "
-                "BeautifulSoup constructor. The tree builder is responsible "
-                "for understanding self-closing tags.")
-
-        if 'isHTML' in kwargs:
-            del kwargs['isHTML']
-            warnings.warn(
-                "BS4 does not respect the isHTML argument to the "
-                "BeautifulSoup constructor. You can pass in features='html' "
-                "or features='xml' to get a builder capable of handling "
-                "one or the other.")
-
-        def deprecated_argument(old_name, new_name):
-            if old_name in kwargs:
-                warnings.warn(
-                    'The "%s" argument to the BeautifulSoup constructor '
-                    'has been renamed to "%s."' % (old_name, new_name))
-                value = kwargs[old_name]
-                del kwargs[old_name]
-                return value
+    def lookup(self, *features):
+        if len(self.builders) == 0:
+            # There are no builders at all.
             return None
 
-        parse_only = parse_only or deprecated_argument(
-            "parseOnlyThese", "parse_only")
+        if len(features) == 0:
+            # They didn't ask for any features. Give them the most
+            # recently registered builder.
+            return self.builders[0]
 
-        from_encoding = from_encoding or deprecated_argument(
-            "fromEncoding", "from_encoding")
+        # Go down the list of features in order, and eliminate any builders
+        # that don't match every feature.
+        features = list(features)
+        features.reverse()
+        candidates = None
+        candidate_set = None
+        while len(features) > 0:
+            feature = features.pop()
+            we_have_the_feature = self.builders_for_feature.get(feature, [])
+            if len(we_have_the_feature) > 0:
+                if candidates is None:
+                    candidates = we_have_the_feature
+                    candidate_set = set(candidates)
+                else:
+                    # Eliminate any candidates that don't have this feature.
+                    candidate_set = candidate_set.intersection(
+                        set(we_have_the_feature))
 
-        if len(kwargs) > 0:
-            arg = kwargs.keys().pop()
-            raise TypeError(
-                "__init__() got an unexpected keyword argument '%s'" % arg)
+        # The only valid candidates are the ones in candidate_set.
+        # Go through the original list of candidates and pick the first one
+        # that's in candidate_set.
+        if candidate_set is None:
+            return None
+        for candidate in candidates:
+            if candidate in candidate_set:
+                return candidate
+        return None
 
-        if builder is None:
-            if isinstance(features, basestring):
-                features = [features]
-            if features is None or len(features) == 0:
-                features = self.DEFAULT_BUILDER_FEATURES
-            builder_class = builder_registry.lookup(*features)
-            if builder_class is None:
-                raise FeatureNotFound(
-                    "Couldn't find a tree builder with the features you "
-                    "requested: %s. Do you need to install a parser library?"
-                    % ",".join(features))
-            builder = builder_class()
-        self.builder = builder
-        self.is_xml = builder.is_xml
-        self.builder.soup = self
+# The BeautifulSoup class will take feature lists from developers and use them
+# to look up builders in this registry.
+builder_registry = TreeBuilderRegistry()
 
-        self.parse_only = parse_only
+class TreeBuilder(object):
+    """Turn a document into a Beautiful Soup object tree."""
 
-        if hasattr(markup, 'read'):        # It's a file-type object.
-            markup = markup.read()
-        elif len(markup) <= 256:
-            # Print out warnings for a couple beginner problems
-            # involving passing non-markup to Beautiful Soup.
-            # Beautiful Soup will still parse the input as markup,
-            # just in case that's what the user really wants.
-            if (isinstance(markup, unicode)
-                and not os.path.supports_unicode_filenames):
-                possible_filename = markup.encode("utf8")
-            else:
-                possible_filename = markup
-            is_file = False
-            try:
-                is_file = os.path.exists(possible_filename)
-            except Exception, e:
-                # This is almost certainly a problem involving
-                # characters not valid in filenames on this
-                # system. Just let it go.
-                pass
-            if is_file:
-                warnings.warn(
-                    '"%s" looks like a filename, not markup. You should probably open this file and pass the filehandle into Beautiful Soup.' % markup)
-            if markup[:5] == "http:" or markup[:6] == "https:":
-                # TODO: This is ugly but I couldn't get it to work in
-                # Python 3 otherwise.
-                if ((isinstance(markup, bytes) and not b' ' in markup)
-                    or (isinstance(markup, unicode) and not u' ' in markup)):
-                    warnings.warn(
-                        '"%s" looks like a URL. Beautiful Soup is not an HTTP client. You should probably use an HTTP client to get the document behind the URL, and feed that document to Beautiful Soup.' % markup)
+    features = []
 
-        for (self.markup, self.original_encoding, self.declared_html_encoding,
-         self.contains_replacement_characters) in (
-            self.builder.prepare_markup(markup, from_encoding)):
-            self.reset()
-            try:
-                self._feed()
-                break
-            except ParserRejectedMarkup:
-                pass
+    is_xml = False
+    preserve_whitespace_tags = set()
+    empty_element_tags = None # A tag will be considered an empty-element
+                              # tag when and only when it has no contents.
 
-        # Clear out the markup and remove the builder's circular
-        # reference to this object.
-        self.markup = None
-        self.builder.soup = None
+    # A value for these tag/attribute combinations is a space- or
+    # comma-separated list of CDATA, rather than a single CDATA.
+    cdata_list_attributes = {}
 
-    def _feed(self):
-        # Convert the document to Unicode.
-        self.builder.reset()
 
-        self.builder.feed(self.markup)
-        # Close out any unfinished strings and close all the open tags.
-        self.endData()
-        while self.currentTag.name != self.ROOT_TAG_NAME:
-            self.popTag()
+    def __init__(self):
+        self.soup = None
 
     def reset(self):
-        Tag.__init__(self, self, self.builder, self.ROOT_TAG_NAME)
-        self.hidden = 1
-        self.builder.reset()
-        self.current_data = []
-        self.currentTag = None
-        self.tagStack = []
-        self.preserve_whitespace_tag_stack = []
-        self.pushTag(self)
+        pass
 
-    def new_tag(self, name, namespace=None, nsprefix=None, **attrs):
-        """Create a new tag associated with this soup."""
-        return Tag(None, self.builder, name, namespace, nsprefix, attrs)
+    def can_be_empty_element(self, tag_name):
+        """Might a tag with this name be an empty-element tag?
 
-    def new_string(self, s, subclass=NavigableString):
-        """Create a new NavigableString associated with this soup."""
-        navigable = subclass(s)
-        navigable.setup()
-        return navigable
+        The final markup may or may not actually present this tag as
+        self-closing.
 
-    def insert_before(self, successor):
-        raise NotImplementedError("BeautifulSoup objects don't support insert_before().")
+        For instance: an HTMLBuilder does not consider a <p> tag to be
+        an empty-element tag (it's not in
+        HTMLBuilder.empty_element_tags). This means an empty <p> tag
+        will be presented as "<p></p>", not "<p />".
 
-    def insert_after(self, successor):
-        raise NotImplementedError("BeautifulSoup objects don't support insert_after().")
-
-    def popTag(self):
-        tag = self.tagStack.pop()
-        if self.preserve_whitespace_tag_stack and tag == self.preserve_whitespace_tag_stack[-1]:
-            self.preserve_whitespace_tag_stack.pop()
-        #print "Pop", tag.name
-        if self.tagStack:
-            self.currentTag = self.tagStack[-1]
-        return self.currentTag
-
-    def pushTag(self, tag):
-        #print "Push", tag.name
-        if self.currentTag:
-            self.currentTag.contents.append(tag)
-        self.tagStack.append(tag)
-        self.currentTag = self.tagStack[-1]
-        if tag.name in self.builder.preserve_whitespace_tags:
-            self.preserve_whitespace_tag_stack.append(tag)
-
-    def endData(self, containerClass=NavigableString):
-        if self.current_data:
-            current_data = u''.join(self.current_data)
-            # If whitespace is not preserved, and this string contains
-            # nothing but ASCII spaces, replace it with a single space
-            # or newline.
-            if not self.preserve_whitespace_tag_stack:
-                strippable = True
-                for i in current_data:
-                    if i not in self.ASCII_SPACES:
-                        strippable = False
-                        break
-                if strippable:
-                    if '\n' in current_data:
-                        current_data = '\n'
-                    else:
-                        current_data = ' '
-
-            # Reset the data collector.
-            self.current_data = []
-
-            # Should we add this string to the tree at all?
-            if self.parse_only and len(self.tagStack) <= 1 and \
-                   (not self.parse_only.text or \
-                    not self.parse_only.search(current_data)):
-                return
-
-            o = containerClass(current_data)
-            self.object_was_parsed(o)
-
-    def object_was_parsed(self, o, parent=None, most_recent_element=None):
-        """Add an object to the parse tree."""
-        parent = parent or self.currentTag
-        most_recent_element = most_recent_element or self._most_recent_element
-        o.setup(parent, most_recent_element)
-
-        if most_recent_element is not None:
-            most_recent_element.next_element = o
-        self._most_recent_element = o
-        parent.contents.append(o)
-
-    def _popToTag(self, name, nsprefix=None, inclusivePop=True):
-        """Pops the tag stack up to and including the most recent
-        instance of the given tag. If inclusivePop is false, pops the tag
-        stack up to but *not* including the most recent instqance of
-        the given tag."""
-        #print "Popping to %s" % name
-        if name == self.ROOT_TAG_NAME:
-            # The BeautifulSoup object itself can never be popped.
-            return
-
-        most_recently_popped = None
-
-        stack_size = len(self.tagStack)
-        for i in range(stack_size - 1, 0, -1):
-            t = self.tagStack[i]
-            if (name == t.name and nsprefix == t.prefix):
-                if inclusivePop:
-                    most_recently_popped = self.popTag()
-                break
-            most_recently_popped = self.popTag()
-
-        return most_recently_popped
-
-    def handle_starttag(self, name, namespace, nsprefix, attrs):
-        """Push a start tag on to the stack.
-
-        If this method returns None, the tag was rejected by the
-        SoupStrainer. You should proceed as if the tag had not occured
-        in the document. For instance, if this was a self-closing tag,
-        don't call handle_endtag.
+        The default implementation has no opinion about which tags are
+        empty-element tags, so a tag will be presented as an
+        empty-element tag if and only if it has no contents.
+        "<foo></foo>" will become "<foo />", and "<foo>bar</foo>" will
+        be left alone.
         """
+        if self.empty_element_tags is None:
+            return True
+        return tag_name in self.empty_element_tags
 
-        # print "Start tag %s: %s" % (name, attrs)
-        self.endData()
+    def feed(self, markup):
+        raise NotImplementedError()
 
-        if (self.parse_only and len(self.tagStack) <= 1
-            and (self.parse_only.text
-                 or not self.parse_only.search_tag(name, attrs))):
-            return None
+    def prepare_markup(self, markup, user_specified_encoding=None,
+                       document_declared_encoding=None):
+        return markup, None, None, False
 
-        tag = Tag(self, self.builder, name, namespace, nsprefix, attrs,
-                  self.currentTag, self._most_recent_element)
-        if tag is None:
-            return tag
-        if self._most_recent_element:
-            self._most_recent_element.next_element = tag
-        self._most_recent_element = tag
-        self.pushTag(tag)
-        return tag
+    def test_fragment_to_document(self, fragment):
+        """Wrap an HTML fragment to make it look like a document.
 
-    def handle_endtag(self, name, nsprefix=None):
-        #print "End tag: " + name
-        self.endData()
-        self._popToTag(name, nsprefix)
+        Different parsers do this differently. For instance, lxml
+        introduces an empty <head> tag, and html5lib
+        doesn't. Abstracting this away lets us write simple tests
+        which run HTML fragments through the parser and compare the
+        results against other HTML fragments.
 
-    def handle_data(self, data):
-        self.current_data.append(data)
+        This method should not be used outside of tests.
+        """
+        return fragment
 
-    def decode(self, pretty_print=False,
-               eventual_encoding=DEFAULT_OUTPUT_ENCODING,
-               formatter="minimal"):
-        """Returns a string or Unicode representation of this document.
-        To get Unicode, pass None for encoding."""
+    def set_up_substitutions(self, tag):
+        return False
 
-        if self.is_xml:
-            # Print the XML declaration
-            encoding_part = ''
-            if eventual_encoding != None:
-                encoding_part = ' encoding="%s"' % eventual_encoding
-            prefix = u'<?xml version="1.0"%s?>\n' % encoding_part
-        else:
-            prefix = u''
-        if not pretty_print:
-            indent_level = None
-        else:
-            indent_level = 0
-        return prefix + super(BeautifulSoup, self).decode(
-            indent_level, eventual_encoding, formatter)
+    def _replace_cdata_list_attribute_values(self, tag_name, attrs):
+        """Replaces class="foo bar" with class=["foo", "bar"]
 
-# Alias to make it easier to type import: 'from bs4 import _soup'
-_s = BeautifulSoup
-_soup = BeautifulSoup
+        Modifies its input in place.
+        """
+        if not attrs:
+            return attrs
+        if self.cdata_list_attributes:
+            universal = self.cdata_list_attributes.get('*', [])
+            tag_specific = self.cdata_list_attributes.get(
+                tag_name.lower(), None)
+            for attr in attrs.keys():
+                if attr in universal or (tag_specific and attr in tag_specific):
+                    # We have a "class"-type attribute whose string
+                    # value is a whitespace-separated list of
+                    # values. Split it into a list.
+                    value = attrs[attr]
+                    if isinstance(value, basestring):
+                        values = whitespace_re.split(value)
+                    else:
+                        # html5lib sometimes calls setAttributes twice
+                        # for the same tag when rearranging the parse
+                        # tree. On the second call the attribute value
+                        # here is already a list.  If this happens,
+                        # leave the value alone rather than trying to
+                        # split it again.
+                        values = value
+                    attrs[attr] = values
+        return attrs
 
-class BeautifulStoneSoup(BeautifulSoup):
-    """Deprecated interface to an XML parser."""
+class SAXTreeBuilder(TreeBuilder):
+    """A Beautiful Soup treebuilder that listens for SAX events."""
 
-    def __init__(self, *args, **kwargs):
-        kwargs['features'] = 'xml'
-        warnings.warn(
-            'The BeautifulStoneSoup class is deprecated. Instead of using '
-            'it, pass features="xml" into the BeautifulSoup constructor.')
-        super(BeautifulStoneSoup, self).__init__(*args, **kwargs)
+    def feed(self, markup):
+        raise NotImplementedError()
+
+    def close(self):
+        pass
+
+    def startElement(self, name, attrs):
+        attrs = dict((key[1], value) for key, value in list(attrs.items()))
+        #print "Start %s, %r" % (name, attrs)
+        self.soup.handle_starttag(name, attrs)
+
+    def endElement(self, name):
+        #print "End %s" % name
+        self.soup.handle_endtag(name)
+
+    def startElementNS(self, nsTuple, nodeName, attrs):
+        # Throw away (ns, nodeName) for now.
+        self.startElement(nodeName, attrs)
+
+    def endElementNS(self, nsTuple, nodeName):
+        # Throw away (ns, nodeName) for now.
+        self.endElement(nodeName)
+        #handler.endElementNS((ns, node.nodeName), node.nodeName)
+
+    def startPrefixMapping(self, prefix, nodeValue):
+        # Ignore the prefix for now.
+        pass
+
+    def endPrefixMapping(self, prefix):
+        # Ignore the prefix for now.
+        # handler.endPrefixMapping(prefix)
+        pass
+
+    def characters(self, content):
+        self.soup.handle_data(content)
+
+    def startDocument(self):
+        pass
+
+    def endDocument(self):
+        pass
 
 
-class StopParsing(Exception):
+class HTMLTreeBuilder(TreeBuilder):
+    """This TreeBuilder knows facts about HTML.
+
+    Such as which tags are empty-element tags.
+    """
+
+    preserve_whitespace_tags = set(['pre', 'textarea'])
+    empty_element_tags = set(['br' , 'hr', 'input', 'img', 'meta',
+                              'spacer', 'link', 'frame', 'base'])
+
+    # The HTML standard defines these attributes as containing a
+    # space-separated list of values, not a single value. That is,
+    # class="foo bar" means that the 'class' attribute has two values,
+    # 'foo' and 'bar', not the single value 'foo bar'.  When we
+    # encounter one of these attributes, we will parse its value into
+    # a list of values if possible. Upon output, the list will be
+    # converted back into a string.
+    cdata_list_attributes = {
+        "*" : ['class', 'accesskey', 'dropzone'],
+        "a" : ['rel', 'rev'],
+        "link" :  ['rel', 'rev'],
+        "td" : ["headers"],
+        "th" : ["headers"],
+        "td" : ["headers"],
+        "form" : ["accept-charset"],
+        "object" : ["archive"],
+
+        # These are HTML5 specific, as are *.accesskey and *.dropzone above.
+        "area" : ["rel"],
+        "icon" : ["sizes"],
+        "iframe" : ["sandbox"],
+        "output" : ["for"],
+        }
+
+    def set_up_substitutions(self, tag):
+        # We are only interested in <meta> tags
+        if tag.name != 'meta':
+            return False
+
+        http_equiv = tag.get('http-equiv')
+        content = tag.get('content')
+        charset = tag.get('charset')
+
+        # We are interested in <meta> tags that say what encoding the
+        # document was originally in. This means HTML 5-style <meta>
+        # tags that provide the "charset" attribute. It also means
+        # HTML 4-style <meta> tags that provide the "content"
+        # attribute and have "http-equiv" set to "content-type".
+        #
+        # In both cases we will replace the value of the appropriate
+        # attribute with a standin object that can take on any
+        # encoding.
+        meta_encoding = None
+        if charset is not None:
+            # HTML 5 style:
+            # <meta charset="utf8">
+            meta_encoding = charset
+            tag['charset'] = CharsetMetaAttributeValue(charset)
+
+        elif (content is not None and http_equiv is not None
+              and http_equiv.lower() == 'content-type'):
+            # HTML 4 style:
+            # <meta http-equiv="content-type" content="text/html; charset=utf8">
+            tag['content'] = ContentMetaAttributeValue(content)
+
+        return (meta_encoding is not None)
+
+def register_treebuilders_from(module):
+    """Copy TreeBuilders from the given module into this module."""
+    # I'm fairly sure this is not the best way to do this.
+    this_module = sys.modules['bs4.builder']
+    for name in module.__all__:
+        obj = getattr(module, name)
+
+        if issubclass(obj, TreeBuilder):
+            setattr(this_module, name, obj)
+            this_module.__all__.append(name)
+            # Register the builder while we're at it.
+            this_module.builder_registry.register(obj)
+
+class ParserRejectedMarkup(Exception):
     pass
 
-class FeatureNotFound(ValueError):
+# Builders are registered in reverse order of priority, so that custom
+# builder registrations will take precedence. In general, we want lxml
+# to take precedence over html5lib, because it's faster. And we only
+# want to use HTMLParser as a last result.
+from . import _htmlparser
+register_treebuilders_from(_htmlparser)
+try:
+    from . import _html5lib
+    register_treebuilders_from(_html5lib)
+except ImportError:
+    # They don't have html5lib installed.
     pass
-
-
-#By default, act as an HTML pretty-printer.
-if __name__ == '__main__':
-    import sys
-    soup = BeautifulSoup(sys.stdin)
-    print soup.prettify()
+try:
+    from . import _lxml
+    register_treebuilders_from(_lxml)
+except ImportError:
+    # They don't have lxml installed.
+    pass
