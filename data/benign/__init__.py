@@ -1,15 +1,29 @@
-from pandas.io.json._json import (
-    read_json,
-    to_json,
-    ujson_dumps,
-    ujson_loads,
-)
-from pandas.io.json._table_schema import build_table_schema
+def __getattr__(key: str):
+    # These imports need to be lazy to avoid circular import errors
+    if key == "hash_array":
+        from pandas.core.util.hashing import hash_array
 
-__all__ = [
-    "build_table_schema",
-    "read_json",
-    "to_json",
-    "ujson_dumps",
-    "ujson_loads",
-]
+        return hash_array
+    if key == "hash_pandas_object":
+        from pandas.core.util.hashing import hash_pandas_object
+
+        return hash_pandas_object
+    if key == "Appender":
+        from pandas.util._decorators import Appender
+
+        return Appender
+    if key == "Substitution":
+        from pandas.util._decorators import Substitution
+
+        return Substitution
+
+    if key == "cache_readonly":
+        from pandas.util._decorators import cache_readonly
+
+        return cache_readonly
+
+    raise AttributeError(f"module 'pandas.util' has no attribute '{key}'")
+
+
+def __dir__() -> list[str]:
+    return [*list(globals().keys()), "hash_array", "hash_pandas_object"]
