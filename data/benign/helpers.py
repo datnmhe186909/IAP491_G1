@@ -1,635 +1,1123 @@
-from __future__ import annotations
+"""Various helper functions"""
 
-import importlib.util
+import asyncio
+import base64
+import binascii
+import contextlib
+import dataclasses
+import datetime
+import enum
+import functools
+import inspect
+import netrc
 import os
+import platform
+import re
 import sys
-import typing as t
-from datetime import datetime
-from functools import cache
-from functools import update_wrapper
+import time
+import warnings
+import weakref
+from collections import namedtuple
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import suppress
+from email.message import EmailMessage
+from email.parser import HeaderParser
+from email.policy import HTTP
+from email.utils import parsedate
+from http.cookies import SimpleCookie
+from math import ceil
+from pathlib import Path
+from types import MappingProxyType, TracebackType
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ContextManager,
+    Generic,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    final,
+    get_args,
+    overload,
+)
+from urllib.parse import quote
+from urllib.request import getproxies, proxy_bypass
 
-import werkzeug.utils
-from werkzeug.exceptions import abort as _wz_abort
-from werkzeug.utils import redirect as _wz_redirect
-from werkzeug.wrappers import Response as BaseResponse
+from multidict import CIMultiDict, MultiDict, MultiDictProxy, MultiMapping
+from propcache.api import under_cached_property as reify
+from yarl import URL
 
-from .globals import _cv_app
-from .globals import app_ctx
-from .globals import current_app
-from .globals import request
-from .globals import session
-from .signals import message_flashed
+from . import hdrs
+from .log import client_logger
+from .typedefs import PathLike  # noqa
 
-if t.TYPE_CHECKING:  # pragma: no cover
-    from .wrappers import Response
+if sys.version_info >= (3, 11):
+    import asyncio as async_timeout
+else:
+    import async_timeout
+
+if TYPE_CHECKING:
+    from dataclasses import dataclass as frozen_dataclass_decorator
+else:
+    frozen_dataclass_decorator = functools.partial(
+        dataclasses.dataclass, frozen=True, slots=True
+    )
+
+__all__ = ("BasicAuth", "ChainMapProxy", "ETag", "frozen_dataclass_decorator", "reify")
+
+COOKIE_MAX_LENGTH = 4096
+
+_T = TypeVar("_T")
+_S = TypeVar("_S")
+
+_SENTINEL = enum.Enum("_SENTINEL", "sentinel")
+sentinel = _SENTINEL.sentinel
+
+NO_EXTENSIONS = bool(os.environ.get("AIOHTTP_NO_EXTENSIONS"))
+
+# https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.1
+EMPTY_BODY_STATUS_CODES = frozenset((204, 304, *range(100, 200)))
+# https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.1
+# https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.2
+EMPTY_BODY_METHODS = hdrs.METH_HEAD_ALL
+
+DEBUG = sys.flags.dev_mode or (
+    not sys.flags.ignore_environment and bool(os.environ.get("PYTHONASYNCIODEBUG"))
+)
 
 
-def get_debug_flag() -> bool:
-    """Get whether debug mode should be enabled for the app, indicated by the
-    :envvar:`FLASK_DEBUG` environment variable. The default is ``False``.
+CHAR = {chr(i) for i in range(0, 128)}
+CTL = {chr(i) for i in range(0, 32)} | {
+    chr(127),
+}
+SEPARATORS = {
+    "(",
+    ")",
+    "<",
+    ">",
+    "@",
+    ",",
+    ";",
+    ":",
+    "\\",
+    '"',
+    "/",
+    "[",
+    "]",
+    "?",
+    "=",
+    "{",
+    "}",
+    " ",
+    chr(9),
+}
+TOKEN = CHAR ^ CTL ^ SEPARATORS
+
+
+json_re = re.compile(r"(?:application/|[\w.-]+/[\w.+-]+?\+)json$", re.IGNORECASE)
+
+
+class BasicAuth(namedtuple("BasicAuth", ["login", "password", "encoding"])):
+    """Http basic authentication helper."""
+
+    def __new__(
+        cls, login: str, password: str = "", encoding: str = "latin1"
+    ) -> "BasicAuth":
+        if login is None:
+            raise ValueError("None is not allowed as login value")
+
+        if password is None:
+            raise ValueError("None is not allowed as password value")
+
+        if ":" in login:
+            raise ValueError('A ":" is not allowed in login (RFC 1945#section-11.1)')
+
+        return super().__new__(cls, login, password, encoding)
+
+    @classmethod
+    def decode(cls, auth_header: str, encoding: str = "latin1") -> "BasicAuth":
+        """Create a BasicAuth object from an Authorization HTTP header."""
+        try:
+            auth_type, encoded_credentials = auth_header.split(" ", 1)
+        except ValueError:
+            raise ValueError("Could not parse authorization header.")
+
+        if auth_type.lower() != "basic":
+            raise ValueError("Unknown authorization method %s" % auth_type)
+
+        try:
+            decoded = base64.b64decode(
+                encoded_credentials.encode("ascii"), validate=True
+            ).decode(encoding)
+        except binascii.Error:
+            raise ValueError("Invalid base64 encoding.")
+
+        try:
+            # RFC 2617 HTTP Authentication
+            # https://www.ietf.org/rfc/rfc2617.txt
+            # the colon must be present, but the username and password may be
+            # otherwise blank.
+            username, password = decoded.split(":", 1)
+        except ValueError:
+            raise ValueError("Invalid credentials.")
+
+        return cls(username, password, encoding=encoding)
+
+    @classmethod
+    def from_url(cls, url: URL, *, encoding: str = "latin1") -> Optional["BasicAuth"]:
+        """Create BasicAuth from url."""
+        if not isinstance(url, URL):
+            raise TypeError("url should be yarl.URL instance")
+        # Check raw_user and raw_password first as yarl is likely
+        # to already have these values parsed from the netloc in the cache.
+        if url.raw_user is None and url.raw_password is None:
+            return None
+        return cls(url.user or "", url.password or "", encoding=encoding)
+
+    def encode(self) -> str:
+        """Encode credentials."""
+        creds = (f"{self.login}:{self.password}").encode(self.encoding)
+        return "Basic %s" % base64.b64encode(creds).decode(self.encoding)
+
+
+def strip_auth_from_url(url: URL) -> tuple[URL, BasicAuth | None]:
+    """Remove user and password from URL if present and return BasicAuth object."""
+    # Check raw_user and raw_password first as yarl is likely
+    # to already have these values parsed from the netloc in the cache.
+    if url.raw_user is None and url.raw_password is None:
+        return url, None
+    return url.with_user(None), BasicAuth(url.user or "", url.password or "")
+
+
+def netrc_from_env() -> netrc.netrc | None:
+    """Load netrc from file.
+
+    Attempt to load it from the path specified by the env-var
+    NETRC or in the default location in the user's home directory.
+
+    Returns None if it couldn't be found or fails to parse.
     """
-    val = os.environ.get("FLASK_DEBUG")
-    return bool(val and val.lower() not in {"0", "false", "no"})
+    netrc_env = os.environ.get("NETRC")
 
-
-def get_load_dotenv(default: bool = True) -> bool:
-    """Get whether the user has disabled loading default dotenv files by
-    setting :envvar:`FLASK_SKIP_DOTENV`. The default is ``True``, load
-    the files.
-
-    :param default: What to return if the env var isn't set.
-    """
-    val = os.environ.get("FLASK_SKIP_DOTENV")
-
-    if not val:
-        return default
-
-    return val.lower() in ("0", "false", "no")
-
-
-@t.overload
-def stream_with_context(
-    generator_or_function: t.Iterator[t.AnyStr],
-) -> t.Iterator[t.AnyStr]: ...
-
-
-@t.overload
-def stream_with_context(
-    generator_or_function: t.Callable[..., t.Iterator[t.AnyStr]],
-) -> t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]: ...
-
-
-def stream_with_context(
-    generator_or_function: t.Iterator[t.AnyStr] | t.Callable[..., t.Iterator[t.AnyStr]],
-) -> t.Iterator[t.AnyStr] | t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]:
-    """Wrap a response generator function so that it runs inside the current
-    request context. This keeps :data:`.request`, :data:`.session`, and :data:`.g`
-    available, even though at the point the generator runs the request context
-    will typically have ended.
-
-    Use it as a decorator on a generator function:
-
-    .. code-block:: python
-
-        from flask import stream_with_context, request, Response
-
-        @app.get("/stream")
-        def streamed_response():
-            @stream_with_context
-            def generate():
-                yield "Hello "
-                yield request.args["name"]
-                yield "!"
-
-            return Response(generate())
-
-    Or use it as a wrapper around a created generator:
-
-    .. code-block:: python
-
-        from flask import stream_with_context, request, Response
-
-        @app.get("/stream")
-        def streamed_response():
-            def generate():
-                yield "Hello "
-                yield request.args["name"]
-                yield "!"
-
-            return Response(stream_with_context(generate()))
-
-    .. versionadded:: 0.9
-    """
-    try:
-        gen = iter(generator_or_function)  # type: ignore[arg-type]
-    except TypeError:
-
-        def decorator(*args: t.Any, **kwargs: t.Any) -> t.Any:
-            gen = generator_or_function(*args, **kwargs)  # type: ignore[operator]
-            return stream_with_context(gen)
-
-        return update_wrapper(decorator, generator_or_function)  # type: ignore[arg-type]
-
-    def generator() -> t.Iterator[t.AnyStr]:
-        if (ctx := _cv_app.get(None)) is None:
-            raise RuntimeError(
-                "'stream_with_context' can only be used when a request"
-                " context is active, such as in a view function."
+    if netrc_env is not None:
+        netrc_path = Path(netrc_env)
+    else:
+        try:
+            home_dir = Path.home()
+        except RuntimeError as e:
+            # if pathlib can't resolve home, it may raise a RuntimeError
+            client_logger.debug(
+                "Could not resolve home directory when "
+                "trying to look for .netrc file: %s",
+                e,
             )
+            return None
 
-        with ctx:
-            yield None  # type: ignore[misc]
-
-            try:
-                yield from gen
-            finally:
-                # Clean up in case the user wrapped a WSGI iterator.
-                if hasattr(gen, "close"):
-                    gen.close()
-
-    # Execute the generator to the sentinel value. This captures the current
-    # context and pushes it to preserve it. Further iteration will yield from
-    # the original iterator.
-    wrapped_g = generator()
-    next(wrapped_g)
-    return wrapped_g
-
-
-def make_response(*args: t.Any) -> Response:
-    """Sometimes it is necessary to set additional headers in a view.  Because
-    views do not have to return response objects but can return a value that
-    is converted into a response object by Flask itself, it becomes tricky to
-    add headers to it.  This function can be called instead of using a return
-    and you will get a response object which you can use to attach headers.
-
-    If view looked like this and you want to add a new header::
-
-        def index():
-            return render_template('index.html', foo=42)
-
-    You can now do something like this::
-
-        def index():
-            response = make_response(render_template('index.html', foo=42))
-            response.headers['X-Parachutes'] = 'parachutes are cool'
-            return response
-
-    This function accepts the very same arguments you can return from a
-    view function.  This for example creates a response with a 404 error
-    code::
-
-        response = make_response(render_template('not_found.html'), 404)
-
-    The other use case of this function is to force the return value of a
-    view function into a response which is helpful with view
-    decorators::
-
-        response = make_response(view_function())
-        response.headers['X-Parachutes'] = 'parachutes are cool'
-
-    Internally this function does the following things:
-
-    -   if no arguments are passed, it creates a new response argument
-    -   if one argument is passed, :meth:`flask.Flask.make_response`
-        is invoked with it.
-    -   if more than one argument is passed, the arguments are passed
-        to the :meth:`flask.Flask.make_response` function as tuple.
-
-    .. versionadded:: 0.6
-    """
-    if not args:
-        return current_app.response_class()
-    if len(args) == 1:
-        args = args[0]
-    return current_app.make_response(args)
-
-
-def url_for(
-    endpoint: str,
-    *,
-    _anchor: str | None = None,
-    _method: str | None = None,
-    _scheme: str | None = None,
-    _external: bool | None = None,
-    **values: t.Any,
-) -> str:
-    """Generate a URL to the given endpoint with the given values.
-
-    This requires an active request or application context, and calls
-    :meth:`current_app.url_for() <flask.Flask.url_for>`. See that method
-    for full documentation.
-
-    :param endpoint: The endpoint name associated with the URL to
-        generate. If this starts with a ``.``, the current blueprint
-        name (if any) will be used.
-    :param _anchor: If given, append this as ``#anchor`` to the URL.
-    :param _method: If given, generate the URL associated with this
-        method for the endpoint.
-    :param _scheme: If given, the URL will have this scheme if it is
-        external.
-    :param _external: If given, prefer the URL to be internal (False) or
-        require it to be external (True). External URLs include the
-        scheme and domain. When not in an active request, URLs are
-        external by default.
-    :param values: Values to use for the variable parts of the URL rule.
-        Unknown keys are appended as query string arguments, like
-        ``?a=b&c=d``.
-
-    .. versionchanged:: 2.2
-        Calls ``current_app.url_for``, allowing an app to override the
-        behavior.
-
-    .. versionchanged:: 0.10
-       The ``_scheme`` parameter was added.
-
-    .. versionchanged:: 0.9
-       The ``_anchor`` and ``_method`` parameters were added.
-
-    .. versionchanged:: 0.9
-       Calls ``app.handle_url_build_error`` on build errors.
-    """
-    return current_app.url_for(
-        endpoint,
-        _anchor=_anchor,
-        _method=_method,
-        _scheme=_scheme,
-        _external=_external,
-        **values,
-    )
-
-
-def redirect(
-    location: str, code: int = 302, Response: type[BaseResponse] | None = None
-) -> BaseResponse:
-    """Create a redirect response object.
-
-    If :data:`~flask.current_app` is available, it will use its
-    :meth:`~flask.Flask.redirect` method, otherwise it will use
-    :func:`werkzeug.utils.redirect`.
-
-    :param location: The URL to redirect to.
-    :param code: The status code for the redirect.
-    :param Response: The response class to use. Not used when
-        ``current_app`` is active, which uses ``app.response_class``.
-
-    .. versionadded:: 2.2
-        Calls ``current_app.redirect`` if available instead of always
-        using Werkzeug's default ``redirect``.
-    """
-    if (ctx := _cv_app.get(None)) is not None:
-        return ctx.app.redirect(location, code=code)
-
-    return _wz_redirect(location, code=code, Response=Response)
-
-
-def abort(code: int | BaseResponse, *args: t.Any, **kwargs: t.Any) -> t.NoReturn:
-    """Raise an :exc:`~werkzeug.exceptions.HTTPException` for the given
-    status code.
-
-    If :data:`~flask.current_app` is available, it will call its
-    :attr:`~flask.Flask.aborter` object, otherwise it will use
-    :func:`werkzeug.exceptions.abort`.
-
-    :param code: The status code for the exception, which must be
-        registered in ``app.aborter``.
-    :param args: Passed to the exception.
-    :param kwargs: Passed to the exception.
-
-    .. versionadded:: 2.2
-        Calls ``current_app.aborter`` if available instead of always
-        using Werkzeug's default ``abort``.
-    """
-    if (ctx := _cv_app.get(None)) is not None:
-        ctx.app.aborter(code, *args, **kwargs)
-
-    _wz_abort(code, *args, **kwargs)
-
-
-def get_template_attribute(template_name: str, attribute: str) -> t.Any:
-    """Loads a macro (or variable) a template exports.  This can be used to
-    invoke a macro from within Python code.  If you for example have a
-    template named :file:`_cider.html` with the following contents:
-
-    .. sourcecode:: html+jinja
-
-       {% macro hello(name) %}Hello {{ name }}!{% endmacro %}
-
-    You can access this from Python code like this::
-
-        hello = get_template_attribute('_cider.html', 'hello')
-        return hello('World')
-
-    .. versionadded:: 0.2
-
-    :param template_name: the name of the template
-    :param attribute: the name of the variable of macro to access
-    """
-    return getattr(current_app.jinja_env.get_template(template_name).module, attribute)
-
-
-def flash(message: str, category: str = "message") -> None:
-    """Flashes a message to the next request.  In order to remove the
-    flashed message from the session and to display it to the user,
-    the template has to call :func:`get_flashed_messages`.
-
-    .. versionchanged:: 0.3
-       `category` parameter added.
-
-    :param message: the message to be flashed.
-    :param category: the category for the message.  The following values
-                     are recommended: ``'message'`` for any kind of message,
-                     ``'error'`` for errors, ``'info'`` for information
-                     messages and ``'warning'`` for warnings.  However any
-                     kind of string can be used as category.
-    """
-    # Original implementation:
-    #
-    #     session.setdefault('_flashes', []).append((category, message))
-    #
-    # This assumed that changes made to mutable structures in the session are
-    # always in sync with the session object, which is not true for session
-    # implementations that use external storage for keeping their keys/values.
-    flashes = session.get("_flashes", [])
-    flashes.append((category, message))
-    session["_flashes"] = flashes
-    app = current_app._get_current_object()
-    message_flashed.send(
-        app,
-        _async_wrapper=app.ensure_sync,
-        message=message,
-        category=category,
-    )
-
-
-def get_flashed_messages(
-    with_categories: bool = False, category_filter: t.Iterable[str] = ()
-) -> list[str] | list[tuple[str, str]]:
-    """Pulls all flashed messages from the session and returns them.
-    Further calls in the same request to the function will return
-    the same messages.  By default just the messages are returned,
-    but when `with_categories` is set to ``True``, the return value will
-    be a list of tuples in the form ``(category, message)`` instead.
-
-    Filter the flashed messages to one or more categories by providing those
-    categories in `category_filter`.  This allows rendering categories in
-    separate html blocks.  The `with_categories` and `category_filter`
-    arguments are distinct:
-
-    * `with_categories` controls whether categories are returned with message
-      text (``True`` gives a tuple, where ``False`` gives just the message text).
-    * `category_filter` filters the messages down to only those matching the
-      provided categories.
-
-    See :doc:`/patterns/flashing` for examples.
-
-    .. versionchanged:: 0.3
-       `with_categories` parameter added.
-
-    .. versionchanged:: 0.9
-        `category_filter` parameter added.
-
-    :param with_categories: set to ``True`` to also receive categories.
-    :param category_filter: filter of categories to limit return values.  Only
-                            categories in the list will be returned.
-    """
-    flashes = app_ctx._flashes
-    if flashes is None:
-        flashes = session.pop("_flashes") if "_flashes" in session else []
-        app_ctx._flashes = flashes
-    if category_filter:
-        flashes = list(filter(lambda f: f[0] in category_filter, flashes))
-    if not with_categories:
-        return [x[1] for x in flashes]
-    return flashes
-
-
-def _prepare_send_file_kwargs(**kwargs: t.Any) -> dict[str, t.Any]:
-    ctx = app_ctx._get_current_object()
-
-    if kwargs.get("max_age") is None:
-        kwargs["max_age"] = ctx.app.get_send_file_max_age
-
-    kwargs.update(
-        environ=ctx.request.environ,
-        use_x_sendfile=ctx.app.config["USE_X_SENDFILE"],
-        response_class=ctx.app.response_class,
-        _root_path=ctx.app.root_path,
-    )
-    return kwargs
-
-
-def send_file(
-    path_or_file: os.PathLike[t.AnyStr] | str | t.IO[bytes],
-    mimetype: str | None = None,
-    as_attachment: bool = False,
-    download_name: str | None = None,
-    conditional: bool = True,
-    etag: bool | str = True,
-    last_modified: datetime | int | float | None = None,
-    max_age: None | (int | t.Callable[[str | None], int | None]) = None,
-) -> Response:
-    """Send the contents of a file to the client.
-
-    The first argument can be a file path or a file-like object. Paths
-    are preferred in most cases because Werkzeug can manage the file and
-    get extra information from the path. Passing a file-like object
-    requires that the file is opened in binary mode, and is mostly
-    useful when building a file in memory with :class:`io.BytesIO`.
-
-    Never pass file paths provided by a user. The path is assumed to be
-    trusted, so a user could craft a path to access a file you didn't
-    intend. Use :func:`send_from_directory` to safely serve
-    user-requested paths from within a directory.
-
-    If the WSGI server sets a ``file_wrapper`` in ``environ``, it is
-    used, otherwise Werkzeug's built-in wrapper is used. Alternatively,
-    if the HTTP server supports ``X-Sendfile``, configuring Flask with
-    ``USE_X_SENDFILE = True`` will tell the server to send the given
-    path, which is much more efficient than reading it in Python.
-
-    :param path_or_file: The path to the file to send, relative to the
-        current working directory if a relative path is given.
-        Alternatively, a file-like object opened in binary mode. Make
-        sure the file pointer is seeked to the start of the data.
-    :param mimetype: The MIME type to send for the file. If not
-        provided, it will try to detect it from the file name.
-    :param as_attachment: Indicate to a browser that it should offer to
-        save the file instead of displaying it.
-    :param download_name: The default name browsers will use when saving
-        the file. Defaults to the passed file name.
-    :param conditional: Enable conditional and range responses based on
-        request headers. Requires passing a file path and ``environ``.
-    :param etag: Calculate an ETag for the file, which requires passing
-        a file path. Can also be a string to use instead.
-    :param last_modified: The last modified time to send for the file,
-        in seconds. If not provided, it will try to detect it from the
-        file path.
-    :param max_age: How long the client should cache the file, in
-        seconds. If set, ``Cache-Control`` will be ``public``, otherwise
-        it will be ``no-cache`` to prefer conditional caching.
-
-    .. versionchanged:: 2.0
-        ``download_name`` replaces the ``attachment_filename``
-        parameter. If ``as_attachment=False``, it is passed with
-        ``Content-Disposition: inline`` instead.
-
-    .. versionchanged:: 2.0
-        ``max_age`` replaces the ``cache_timeout`` parameter.
-        ``conditional`` is enabled and ``max_age`` is not set by
-        default.
-
-    .. versionchanged:: 2.0
-        ``etag`` replaces the ``add_etags`` parameter. It can be a
-        string to use instead of generating one.
-
-    .. versionchanged:: 2.0
-        Passing a file-like object that inherits from
-        :class:`~io.TextIOBase` will raise a :exc:`ValueError` rather
-        than sending an empty file.
-
-    .. versionadded:: 2.0
-        Moved the implementation to Werkzeug. This is now a wrapper to
-        pass some Flask-specific arguments.
-
-    .. versionchanged:: 1.1
-        ``filename`` may be a :class:`~os.PathLike` object.
-
-    .. versionchanged:: 1.1
-        Passing a :class:`~io.BytesIO` object supports range requests.
-
-    .. versionchanged:: 1.0.3
-        Filenames are encoded with ASCII instead of Latin-1 for broader
-        compatibility with WSGI servers.
-
-    .. versionchanged:: 1.0
-        UTF-8 filenames as specified in :rfc:`2231` are supported.
-
-    .. versionchanged:: 0.12
-        The filename is no longer automatically inferred from file
-        objects. If you want to use automatic MIME and etag support,
-        pass a filename via ``filename_or_fp`` or
-        ``attachment_filename``.
-
-    .. versionchanged:: 0.12
-        ``attachment_filename`` is preferred over ``filename`` for MIME
-        detection.
-
-    .. versionchanged:: 0.9
-        ``cache_timeout`` defaults to
-        :meth:`Flask.get_send_file_max_age`.
-
-    .. versionchanged:: 0.7
-        MIME guessing and etag support for file-like objects was
-        removed because it was unreliable. Pass a filename if you are
-        able to, otherwise attach an etag yourself.
-
-    .. versionchanged:: 0.5
-        The ``add_etags``, ``cache_timeout`` and ``conditional``
-        parameters were added. The default behavior is to add etags.
-
-    .. versionadded:: 0.2
-    """
-    return werkzeug.utils.send_file(  # type: ignore[return-value]
-        **_prepare_send_file_kwargs(
-            path_or_file=path_or_file,
-            environ=request.environ,
-            mimetype=mimetype,
-            as_attachment=as_attachment,
-            download_name=download_name,
-            conditional=conditional,
-            etag=etag,
-            last_modified=last_modified,
-            max_age=max_age,
+        netrc_path = home_dir / (
+            "_netrc" if platform.system() == "Windows" else ".netrc"
         )
-    )
 
-
-def send_from_directory(
-    directory: os.PathLike[str] | str,
-    path: os.PathLike[str] | str,
-    **kwargs: t.Any,
-) -> Response:
-    """Send a file from within a directory using :func:`send_file`.
-
-    .. code-block:: python
-
-        @app.route("/uploads/<path:name>")
-        def download_file(name):
-            return send_from_directory(
-                app.config['UPLOAD_FOLDER'], name, as_attachment=True
-            )
-
-    This is a secure way to serve files from a folder, such as static
-    files or uploads. Uses :func:`~werkzeug.security.safe_join` to
-    ensure the path coming from the client is not maliciously crafted to
-    point outside the specified directory.
-
-    If the final path does not point to an existing regular file,
-    raises a 404 :exc:`~werkzeug.exceptions.NotFound` error.
-
-    :param directory: The directory that ``path`` must be located under,
-        relative to the current application's root path. This *must not*
-        be a value provided by the client, otherwise it becomes insecure.
-    :param path: The path to the file to send, relative to
-        ``directory``.
-    :param kwargs: Arguments to pass to :func:`send_file`.
-
-    .. versionchanged:: 2.0
-        ``path`` replaces the ``filename`` parameter.
-
-    .. versionadded:: 2.0
-        Moved the implementation to Werkzeug. This is now a wrapper to
-        pass some Flask-specific arguments.
-
-    .. versionadded:: 0.5
-    """
-    return werkzeug.utils.send_from_directory(  # type: ignore[return-value]
-        directory, path, **_prepare_send_file_kwargs(**kwargs)
-    )
-
-
-def get_root_path(import_name: str) -> str:
-    """Find the root path of a package, or the path that contains a
-    module. If it cannot be found, returns the current working
-    directory.
-
-    Not to be confused with the value returned by :func:`find_package`.
-
-    :meta private:
-    """
-    # Module already imported and has a file attribute. Use that first.
-    mod = sys.modules.get(import_name)
-
-    if mod is not None and hasattr(mod, "__file__") and mod.__file__ is not None:
-        return os.path.dirname(os.path.abspath(mod.__file__))
-
-    # Next attempt: check the loader.
     try:
-        spec = importlib.util.find_spec(import_name)
+        return netrc.netrc(str(netrc_path))
+    except netrc.NetrcParseError as e:
+        client_logger.warning("Could not parse .netrc file: %s", e)
+    except OSError as e:
+        netrc_exists = False
+        with contextlib.suppress(OSError):
+            netrc_exists = netrc_path.is_file()
+        # we couldn't read the file (doesn't exist, permissions, etc.)
+        if netrc_env or netrc_exists:
+            # only warn if the environment wanted us to load it,
+            # or it appears like the default file does actually exist
+            client_logger.warning("Could not read .netrc file: %s", e)
 
-        if spec is None:
-            raise ValueError
-    except (ImportError, ValueError):
-        loader = None
-    else:
-        loader = spec.loader
+    return None
 
-    # Loader does not exist or we're referring to an unloaded main
-    # module or a main module without path (interactive sessions), go
-    # with the current working directory.
-    if loader is None:
-        return os.getcwd()
 
-    if hasattr(loader, "get_filename"):
-        filepath = loader.get_filename(import_name)  # pyright: ignore
-    else:
-        # Fall back to imports.
-        __import__(import_name)
-        mod = sys.modules[import_name]
-        filepath = getattr(mod, "__file__", None)
+@frozen_dataclass_decorator
+class ProxyInfo:
+    proxy: URL
+    proxy_auth: BasicAuth | None
 
-        # If we don't have a file path it might be because it is a
-        # namespace package. In this case pick the root path from the
-        # first module that is contained in the package.
-        if filepath is None:
-            raise RuntimeError(
-                "No root path can be found for the provided module"
-                f" {import_name!r}. This can happen because the module"
-                " came from an import hook that does not provide file"
-                " name information or because it's a namespace package."
-                " In this case the root path needs to be explicitly"
-                " provided."
+
+def basicauth_from_netrc(netrc_obj: netrc.netrc | None, host: str) -> BasicAuth:
+    """
+    Return :py:class:`~aiohttp.BasicAuth` credentials for ``host`` from ``netrc_obj``.
+
+    :raises LookupError: if ``netrc_obj`` is :py:data:`None` or if no
+            entry is found for the ``host``.
+    """
+    if netrc_obj is None:
+        raise LookupError("No .netrc file found")
+    auth_from_netrc = netrc_obj.authenticators(host)
+
+    if auth_from_netrc is None:
+        raise LookupError(f"No entry for {host!s} found in the `.netrc` file.")
+    login, account, password = auth_from_netrc
+
+    # TODO(PY311): username = login or account
+    # Up to python 3.10, account could be None if not specified,
+    # and login will be empty string if not specified. From 3.11,
+    # login and account will be empty string if not specified.
+    username = login if (login or account is None) else account
+
+    # TODO(PY311): Remove this, as password will be empty string
+    # if not specified
+    if password is None:
+        password = ""  # type: ignore[unreachable]
+
+    return BasicAuth(username, password)
+
+
+def proxies_from_env() -> dict[str, ProxyInfo]:
+    proxy_urls = {
+        k: URL(v)
+        for k, v in getproxies().items()
+        if k in ("http", "https", "ws", "wss")
+    }
+    netrc_obj = netrc_from_env()
+    stripped = {k: strip_auth_from_url(v) for k, v in proxy_urls.items()}
+    ret = {}
+    for proto, val in stripped.items():
+        proxy, auth = val
+        if proxy.scheme in ("https", "wss"):
+            client_logger.warning(
+                "%s proxies %s are not supported, ignoring", proxy.scheme.upper(), proxy
             )
+            continue
+        if netrc_obj and auth is None:
+            if proxy.host is not None:
+                try:
+                    auth = basicauth_from_netrc(netrc_obj, proxy.host)
+                except LookupError:
+                    auth = None
+        ret[proto] = ProxyInfo(proxy, auth)
+    return ret
 
-    # filepath is import_name.py for a module, or __init__.py for a package.
-    return os.path.dirname(os.path.abspath(filepath))  # type: ignore[no-any-return]
+
+def get_env_proxy_for_url(url: URL) -> tuple[URL, BasicAuth | None]:
+    """Get a permitted proxy for the given URL from the env."""
+    if url.host is not None and proxy_bypass(url.host):
+        raise LookupError(f"Proxying is disallowed for `{url.host!r}`")
+
+    proxies_in_env = proxies_from_env()
+    try:
+        proxy_info = proxies_in_env[url.scheme]
+    except KeyError:
+        raise LookupError(f"No proxies found for `{url!s}` in the env")
+    else:
+        return proxy_info.proxy, proxy_info.proxy_auth
 
 
-@cache
-def _split_blueprint_path(name: str) -> list[str]:
-    out: list[str] = [name]
+@frozen_dataclass_decorator
+class MimeType:
+    type: str
+    subtype: str
+    suffix: str
+    parameters: "MultiDictProxy[str]"
 
-    if "." in name:
-        out.extend(_split_blueprint_path(name.rpartition(".")[0]))
 
-    return out
+@functools.lru_cache(maxsize=56)
+def parse_mimetype(mimetype: str) -> MimeType:
+    """Parses a MIME type into its components.
+
+    mimetype is a MIME type string.
+
+    Returns a MimeType object.
+
+    Example:
+
+    >>> parse_mimetype('text/html; charset=utf-8')
+    MimeType(type='text', subtype='html', suffix='',
+             parameters={'charset': 'utf-8'})
+
+    """
+    if not mimetype:
+        return MimeType(
+            type="", subtype="", suffix="", parameters=MultiDictProxy(MultiDict())
+        )
+
+    parts = mimetype.split(";")
+    params: MultiDict[str] = MultiDict()
+    for item in parts[1:]:
+        if not item:
+            continue
+        key, _, value = item.partition("=")
+        params.add(key.lower().strip(), value.strip(' "'))
+
+    fulltype = parts[0].strip().lower()
+    if fulltype == "*":
+        fulltype = "*/*"
+
+    mtype, _, stype = fulltype.partition("/")
+    stype, _, suffix = stype.partition("+")
+
+    return MimeType(
+        type=mtype, subtype=stype, suffix=suffix, parameters=MultiDictProxy(params)
+    )
+
+
+class EnsureOctetStream(EmailMessage):
+    def __init__(self) -> None:
+        super().__init__()
+        # https://www.rfc-editor.org/rfc/rfc9110#section-8.3-5
+        self.set_default_type("application/octet-stream")
+
+    def get_content_type(self) -> str:
+        """Re-implementation from Message
+
+        Returns application/octet-stream in place of plain/text when
+        value is wrong.
+
+        The way this class is used guarantees that content-type will
+        be present so simplify the checks wrt to the base implementation.
+        """
+        value = self.get("content-type", "").lower()
+
+        # Based on the implementation of _splitparam in the standard library
+        ctype, _, _ = value.partition(";")
+        ctype = ctype.strip()
+        if ctype.count("/") != 1:
+            return self.get_default_type()
+        return ctype
+
+
+@functools.lru_cache(maxsize=56)
+def parse_content_type(raw: str) -> tuple[str, MappingProxyType[str, str]]:
+    """Parse Content-Type header.
+
+    Returns a tuple of the parsed content type and a
+    MappingProxyType of parameters. The default returned value
+    is `application/octet-stream`
+    """
+    msg = HeaderParser(EnsureOctetStream, policy=HTTP).parsestr(f"Content-Type: {raw}")
+    content_type = msg.get_content_type()
+    params = msg.get_params(())
+    content_dict = dict(params[1:])  # First element is content type again
+    return content_type, MappingProxyType(content_dict)
+
+
+def guess_filename(obj: Any, default: str | None = None) -> str | None:
+    name = getattr(obj, "name", None)
+    if name and isinstance(name, str) and name[0] != "<" and name[-1] != ">":
+        return Path(name).name
+    return default
+
+
+not_qtext_re = re.compile(r"[^\041\043-\133\135-\176]")
+QCONTENT = {chr(i) for i in range(0x20, 0x7F)} | {"\t"}
+
+
+def quoted_string(content: str) -> str:
+    """Return 7-bit content as quoted-string.
+
+    Format content into a quoted-string as defined in RFC5322 for
+    Internet Message Format. Notice that this is not the 8-bit HTTP
+    format, but the 7-bit email format. Content must be in usascii or
+    a ValueError is raised.
+    """
+    if not (QCONTENT > set(content)):
+        raise ValueError(f"bad content for quoted-string {content!r}")
+    return not_qtext_re.sub(lambda x: "\\" + x.group(0), content)
+
+
+def content_disposition_header(
+    disptype: str,
+    quote_fields: bool = True,
+    _charset: str = "utf-8",
+    params: dict[str, str] | None = None,
+) -> str:
+    """Sets ``Content-Disposition`` header for MIME.
+
+    This is the MIME payload Content-Disposition header from RFC 2183
+    and RFC 7579 section 4.2, not the HTTP Content-Disposition from
+    RFC 6266.
+
+    disptype is a disposition type: inline, attachment, form-data.
+    Should be valid extension token (see RFC 2183)
+
+    quote_fields performs value quoting to 7-bit MIME headers
+    according to RFC 7578. Set to quote_fields to False if recipient
+    can take 8-bit file names and field values.
+
+    _charset specifies the charset to use when quote_fields is True.
+
+    params is a dict with disposition params.
+    """
+    if not disptype or not (TOKEN > set(disptype)):
+        raise ValueError(f"bad content disposition type {disptype!r}")
+
+    value = disptype
+    if params:
+        lparams = []
+        for key, val in params.items():
+            if not key or not (TOKEN > set(key)):
+                raise ValueError(f"bad content disposition parameter {key!r}={val!r}")
+            if quote_fields:
+                if key.lower() == "filename":
+                    qval = quote(val, "", encoding=_charset)
+                    lparams.append((key, '"%s"' % qval))
+                else:
+                    try:
+                        qval = quoted_string(val)
+                    except ValueError:
+                        qval = "".join(
+                            (_charset, "''", quote(val, "", encoding=_charset))
+                        )
+                        lparams.append((key + "*", qval))
+                    else:
+                        lparams.append((key, '"%s"' % qval))
+            else:
+                qval = val.replace("\\", "\\\\").replace('"', '\\"')
+                lparams.append((key, '"%s"' % qval))
+        sparams = "; ".join("=".join(pair) for pair in lparams)
+        value = "; ".join((value, sparams))
+    return value
+
+
+def is_expected_content_type(
+    response_content_type: str, expected_content_type: str
+) -> bool:
+    """Checks if received content type is processable as an expected one.
+
+    Both arguments should be given without parameters.
+    """
+    if expected_content_type == "application/json":
+        return json_re.match(response_content_type) is not None
+    return expected_content_type in response_content_type
+
+
+def is_ip_address(host: str | None) -> bool:
+    """Check if host looks like an IP Address.
+
+    This check is only meant as a heuristic to ensure that
+    a host is not a domain name.
+    """
+    if not host:
+        return False
+    # For a host to be an ipv4 address, it must be all numeric.
+    # The host must contain a colon to be an IPv6 address.
+    return ":" in host or host.replace(".", "").isdigit()
+
+
+_cached_current_datetime: int | None = None
+_cached_formatted_datetime = ""
+
+
+def rfc822_formatted_time() -> str:
+    global _cached_current_datetime
+    global _cached_formatted_datetime
+
+    now = int(time.time())
+    if now != _cached_current_datetime:
+        # Weekday and month names for HTTP date/time formatting;
+        # always English!
+        # Tuples are constants stored in codeobject!
+        _weekdayname = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        _monthname = (
+            "",  # Dummy so we can use 1-based month numbers
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun",
+            "Jul",
+            "Aug",
+            "Sep",
+            "Oct",
+            "Nov",
+            "Dec",
+        )
+
+        year, month, day, hh, mm, ss, wd, *tail = time.gmtime(now)
+        _cached_formatted_datetime = "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (
+            _weekdayname[wd],
+            day,
+            _monthname[month],
+            year,
+            hh,
+            mm,
+            ss,
+        )
+        _cached_current_datetime = now
+    return _cached_formatted_datetime
+
+
+def _weakref_handle(info: "tuple[weakref.ref[object], str]") -> None:
+    ref, name = info
+    ob = ref()
+    if ob is not None:
+        with suppress(Exception):
+            getattr(ob, name)()
+
+
+def weakref_handle(
+    ob: object,
+    name: str,
+    timeout: float | None,
+    loop: asyncio.AbstractEventLoop,
+    timeout_ceil_threshold: float = 5,
+) -> asyncio.TimerHandle | None:
+    if timeout is not None and timeout > 0:
+        when = loop.time() + timeout
+        if timeout >= timeout_ceil_threshold:
+            when = ceil(when)
+
+        return loop.call_at(when, _weakref_handle, (weakref.ref(ob), name))
+    return None
+
+
+def call_later(
+    cb: Callable[[], Any],
+    timeout: float | None,
+    loop: asyncio.AbstractEventLoop,
+    timeout_ceil_threshold: float = 5,
+) -> asyncio.TimerHandle | None:
+    if timeout is None or timeout <= 0:
+        return None
+    now = loop.time()
+    when = calculate_timeout_when(now, timeout, timeout_ceil_threshold)
+    return loop.call_at(when, cb)
+
+
+def calculate_timeout_when(
+    loop_time: float,
+    timeout: float,
+    timeout_ceiling_threshold: float,
+) -> float:
+    """Calculate when to execute a timeout."""
+    when = loop_time + timeout
+    if timeout > timeout_ceiling_threshold:
+        return ceil(when)
+    return when
+
+
+class TimeoutHandle:
+    """Timeout handle"""
+
+    __slots__ = ("_timeout", "_loop", "_ceil_threshold", "_callbacks")
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        timeout: float | None,
+        ceil_threshold: float = 5,
+    ) -> None:
+        self._timeout = timeout
+        self._loop = loop
+        self._ceil_threshold = ceil_threshold
+        self._callbacks: list[
+            tuple[Callable[..., None], tuple[Any, ...], dict[str, Any]]
+        ] = []
+
+    def register(
+        self, callback: Callable[..., None], *args: Any, **kwargs: Any
+    ) -> None:
+        self._callbacks.append((callback, args, kwargs))
+
+    def close(self) -> None:
+        self._callbacks.clear()
+
+    def start(self) -> asyncio.TimerHandle | None:
+        timeout = self._timeout
+        if timeout is not None and timeout > 0:
+            when = self._loop.time() + timeout
+            if timeout >= self._ceil_threshold:
+                when = ceil(when)
+            return self._loop.call_at(when, self.__call__)
+        else:
+            return None
+
+    def timer(self) -> "BaseTimerContext":
+        if self._timeout is not None and self._timeout > 0:
+            timer = TimerContext(self._loop)
+            self.register(timer.timeout)
+            return timer
+        else:
+            return TimerNoop()
+
+    def __call__(self) -> None:
+        for cb, args, kwargs in self._callbacks:
+            with suppress(Exception):
+                cb(*args, **kwargs)
+
+        self._callbacks.clear()
+
+
+class BaseTimerContext(ContextManager["BaseTimerContext"]):
+
+    __slots__ = ()
+
+    def assert_timeout(self) -> None:
+        """Raise TimeoutError if timeout has been exceeded."""
+
+
+class TimerNoop(BaseTimerContext):
+
+    __slots__ = ()
+
+    def __enter__(self) -> BaseTimerContext:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        return
+
+
+class TimerContext(BaseTimerContext):
+    """Low resolution timeout context manager"""
+
+    __slots__ = ("_loop", "_tasks", "_cancelled", "_cancelling")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._cancelled = False
+        self._cancelling = 0
+
+    def assert_timeout(self) -> None:
+        """Raise TimeoutError if timer has already been cancelled."""
+        if self._cancelled:
+            raise asyncio.TimeoutError from None
+
+    def __enter__(self) -> BaseTimerContext:
+        task = asyncio.current_task(loop=self._loop)
+        if task is None:
+            raise RuntimeError("Timeout context manager should be used inside a task")
+
+        if sys.version_info >= (3, 11):
+            # Remember if the task was already cancelling
+            # so when we __exit__ we can decide if we should
+            # raise asyncio.TimeoutError or let the cancellation propagate
+            self._cancelling = task.cancelling()
+
+        if self._cancelled:
+            raise asyncio.TimeoutError from None
+
+        self._tasks.append(task)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
+        enter_task: asyncio.Task[Any] | None = None
+        if self._tasks:
+            enter_task = self._tasks.pop()
+
+        if exc_type is asyncio.CancelledError and self._cancelled:
+            assert enter_task is not None
+            # The timeout was hit, and the task was cancelled
+            # so we need to uncancel the last task that entered the context manager
+            # since the cancellation should not leak out of the context manager
+            if sys.version_info >= (3, 11):
+                # If the task was already cancelling don't raise
+                # asyncio.TimeoutError and instead return None
+                # to allow the cancellation to propagate
+                if enter_task.uncancel() > self._cancelling:
+                    return None
+            raise asyncio.TimeoutError from exc_val
+        return None
+
+    def timeout(self) -> None:
+        if not self._cancelled:
+            for task in set(self._tasks):
+                task.cancel()
+
+            self._cancelled = True
+
+
+def ceil_timeout(
+    delay: float | None, ceil_threshold: float = 5
+) -> async_timeout.Timeout:
+    if delay is None or delay <= 0:
+        return async_timeout.timeout(None)
+
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    when = now + delay
+    if delay > ceil_threshold:
+        when = ceil(when)
+    return async_timeout.timeout_at(when)
+
+
+class HeadersMixin:
+    """Mixin for handling headers."""
+
+    _headers: MultiMapping[str]
+    _content_type: str | None = None
+    _content_dict: dict[str, str] | None = None
+    _stored_content_type: str | None | _SENTINEL = sentinel
+
+    def _parse_content_type(self, raw: str | None) -> None:
+        self._stored_content_type = raw
+        if raw is None:
+            # default value according to RFC 2616
+            self._content_type = "application/octet-stream"
+            self._content_dict = {}
+        else:
+            content_type, content_mapping_proxy = parse_content_type(raw)
+            self._content_type = content_type
+            # _content_dict needs to be mutable so we can update it
+            self._content_dict = content_mapping_proxy.copy()
+
+    @property
+    def content_type(self) -> str:
+        """The value of content part for Content-Type HTTP header."""
+        raw = self._headers.get(hdrs.CONTENT_TYPE)
+        if self._stored_content_type != raw:
+            self._parse_content_type(raw)
+        assert self._content_type is not None
+        return self._content_type
+
+    @property
+    def charset(self) -> str | None:
+        """The value of charset part for Content-Type HTTP header."""
+        raw = self._headers.get(hdrs.CONTENT_TYPE)
+        if self._stored_content_type != raw:
+            self._parse_content_type(raw)
+        assert self._content_dict is not None
+        return self._content_dict.get("charset")
+
+    @property
+    def content_length(self) -> int | None:
+        """The value of Content-Length HTTP header."""
+        content_length = self._headers.get(hdrs.CONTENT_LENGTH)
+        return None if content_length is None else int(content_length)
+
+
+def set_result(fut: "asyncio.Future[_T]", result: _T) -> None:
+    if not fut.done():
+        fut.set_result(result)
+
+
+_EXC_SENTINEL = BaseException()
+
+
+class ErrorableProtocol(Protocol):
+    def set_exception(
+        self,
+        exc: type[BaseException] | BaseException,
+        exc_cause: BaseException = ...,
+    ) -> None: ...
+
+
+def set_exception(
+    fut: Union["asyncio.Future[_T]", ErrorableProtocol],
+    exc: type[BaseException] | BaseException,
+    exc_cause: BaseException = _EXC_SENTINEL,
+) -> None:
+    """Set future exception.
+
+    If the future is marked as complete, this function is a no-op.
+
+    :param exc_cause: An exception that is a direct cause of ``exc``.
+                      Only set if provided.
+    """
+    if asyncio.isfuture(fut) and fut.done():
+        return
+
+    exc_is_sentinel = exc_cause is _EXC_SENTINEL
+    exc_causes_itself = exc is exc_cause
+    if not exc_is_sentinel and not exc_causes_itself:
+        exc.__cause__ = exc_cause
+
+    fut.set_exception(exc)
+
+
+@functools.total_ordering
+class BaseKey(Generic[_T]):
+    """Base for concrete context storage key classes.
+
+    Each storage is provided with its own sub-class for the sake of some additional type safety.
+    """
+
+    __slots__ = ("_name", "_t", "__orig_class__")
+
+    # This may be set by Python when instantiating with a generic type. We need to
+    # support this, in order to support types that are not concrete classes,
+    # like Iterable, which can't be passed as the second parameter to __init__.
+    __orig_class__: type[object]
+
+    # TODO(PY314): Change Type to TypeForm (this should resolve unreachable below).
+    def __init__(self, name: str, t: type[_T] | None = None):
+        # Prefix with module name to help deduplicate key names.
+        frame = inspect.currentframe()
+        while frame:
+            if frame.f_code.co_name == "<module>":
+                module: str = frame.f_globals["__name__"]
+                break
+            frame = frame.f_back
+        else:
+            raise RuntimeError("Failed to get module name.")
+
+        # https://github.com/python/mypy/issues/14209
+        self._name = module + "." + name  # type: ignore[possibly-undefined]
+        self._t = t
+
+    def __lt__(self, other: object) -> bool:
+        if isinstance(other, BaseKey):
+            return self._name < other._name
+        return True  # Order BaseKey above other types.
+
+    def __repr__(self) -> str:
+        t = self._t
+        if t is None:
+            with suppress(AttributeError):
+                # Set to type arg.
+                t = get_args(self.__orig_class__)[0]
+
+        if t is None:
+            t_repr = "<<Unknown>>"
+        elif isinstance(t, type):
+            if t.__module__ == "builtins":
+                t_repr = t.__qualname__
+            else:
+                t_repr = f"{t.__module__}.{t.__qualname__}"
+        else:
+            t_repr = repr(t)  # type: ignore[unreachable]
+        return f"<{self.__class__.__name__}({self._name}, type={t_repr})>"
+
+
+class AppKey(BaseKey[_T]):
+    """Keys for static typing support in Application."""
+
+
+class RequestKey(BaseKey[_T]):
+    """Keys for static typing support in Request."""
+
+
+class ResponseKey(BaseKey[_T]):
+    """Keys for static typing support in Response."""
+
+
+@final
+class ChainMapProxy(Mapping[str | AppKey[Any], Any]):
+    __slots__ = ("_maps",)
+
+    def __init__(self, maps: Iterable[Mapping[str | AppKey[Any], Any]]) -> None:
+        self._maps = tuple(maps)
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError(
+            f"Inheritance class {cls.__name__} from ChainMapProxy is forbidden"
+        )
+
+    @overload  # type: ignore[override]
+    def __getitem__(self, key: AppKey[_T]) -> _T: ...
+
+    @overload
+    def __getitem__(self, key: str) -> Any: ...
+
+    def __getitem__(self, key: str | AppKey[_T]) -> Any:
+        for mapping in self._maps:
+            try:
+                return mapping[key]
+            except KeyError:
+                pass
+        raise KeyError(key)
+
+    @overload  # type: ignore[override]
+    def get(self, key: AppKey[_T], default: _S) -> _T | _S: ...
+
+    @overload
+    def get(self, key: AppKey[_T], default: None = ...) -> _T | None: ...
+
+    @overload
+    def get(self, key: str, default: Any = ...) -> Any: ...
+
+    def get(self, key: str | AppKey[_T], default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __len__(self) -> int:
+        # reuses stored hash values if possible
+        return len(set().union(*self._maps))
+
+    def __iter__(self) -> Iterator[str | AppKey[Any]]:
+        d: dict[str | AppKey[Any], Any] = {}
+        for mapping in reversed(self._maps):
+            # reuses stored hash values if possible
+            d.update(mapping)
+        return iter(d)
+
+    def __contains__(self, key: object) -> bool:
+        return any(key in m for m in self._maps)
+
+    def __bool__(self) -> bool:
+        return any(self._maps)
+
+    def __repr__(self) -> str:
+        content = ", ".join(map(repr, self._maps))
+        return f"ChainMapProxy({content})"
+
+
+class CookieMixin:
+    """Mixin for handling cookies."""
+
+    _cookies: SimpleCookie | None = None
+
+    @property
+    def cookies(self) -> SimpleCookie:
+        if self._cookies is None:
+            self._cookies = SimpleCookie()
+        return self._cookies
+
+    def set_cookie(
+        self,
+        name: str,
+        value: str,
+        *,
+        expires: str | None = None,
+        domain: str | None = None,
+        max_age: int | str | None = None,
+        path: str = "/",
+        secure: bool | None = None,
+        httponly: bool | None = None,
+        samesite: str | None = None,
+        partitioned: bool | None = None,
+    ) -> None:
+        """Set or update response cookie.
+
+        Sets new cookie or updates existent with new value.
+        Also updates only those params which are not None.
+        """
+        if self._cookies is None:
+            self._cookies = SimpleCookie()
+
+        self._cookies[name] = value
+        c = self._cookies[name]
+
+        if expires is not None:
+            c["expires"] = expires
+        elif c.get("expires") == "Thu, 01 Jan 1970 00:00:00 GMT":
+            del c["expires"]
+
+        if domain is not None:
+            c["domain"] = domain
+
+        if max_age is not None:
+            c["max-age"] = str(max_age)
+        elif "max-age" in c:
+            del c["max-age"]
+
+        c["path"] = path
+
+        if secure is not None:
+            c["secure"] = secure
+        if httponly is not None:
+            c["httponly"] = httponly
+        if samesite is not None:
+            c["samesite"] = samesite
+
+        if partitioned is not None:
+            c["partitioned"] = partitioned
+
+        if DEBUG:
+            cookie_length = len(c.output(header="")[1:])
+            if cookie_length > COOKIE_MAX_LENGTH:
+                warnings.warn(
+                    "The size of is too large, it might get ignored by the client.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+    def del_cookie(
+        self,
+        name: str,
+        *,
+        domain: str | None = None,
+        path: str = "/",
+        secure: bool | None = None,
+        httponly: bool | None = None,
+        samesite: str | None = None,
+    ) -> None:
+        """Delete cookie.
+
+        Creates new empty expired cookie.
+        """
+        # TODO: do we need domain/path here?
+        if self._cookies is not None:
+            self._cookies.pop(name, None)
+        self.set_cookie(
+            name,
+            "",
+            max_age=0,
+            expires="Thu, 01 Jan 1970 00:00:00 GMT",
+            domain=domain,
+            path=path,
+            secure=secure,
+            httponly=httponly,
+            samesite=samesite,
+        )
+
+
+def populate_with_cookies(headers: "CIMultiDict[str]", cookies: SimpleCookie) -> None:
+    for cookie in cookies.values():
+        value = cookie.output(header="")[1:]
+        headers.add(hdrs.SET_COOKIE, value)
+
+
+# https://tools.ietf.org/html/rfc7232#section-2.3
+_ETAGC = r"[!\x23-\x7E\x80-\xff]+"
+_ETAGC_RE = re.compile(_ETAGC)
+_QUOTED_ETAG = rf'(W/)?"({_ETAGC})"'
+QUOTED_ETAG_RE = re.compile(_QUOTED_ETAG)
+LIST_QUOTED_ETAG_RE = re.compile(rf"({_QUOTED_ETAG})(?:\s*,\s*|$)|(.)")
+
+ETAG_ANY = "*"
+
+
+@frozen_dataclass_decorator
+class ETag:
+    value: str
+    is_weak: bool = False
+
+
+def validate_etag_value(value: str) -> None:
+    if value != ETAG_ANY and not _ETAGC_RE.fullmatch(value):
+        raise ValueError(
+            f"Value {value!r} is not a valid etag. Maybe it contains '\"'?"
+        )
+
+
+def parse_http_date(date_str: str | None) -> datetime.datetime | None:
+    """Process a date string, return a datetime object"""
+    if date_str is not None:
+        timetuple = parsedate(date_str)
+        if timetuple is not None:
+            with suppress(ValueError):
+                return datetime.datetime(*timetuple[:6], tzinfo=datetime.timezone.utc)
+    return None
+
+
+@functools.lru_cache
+def must_be_empty_body(method: str, code: int) -> bool:
+    """Check if a request must return an empty body."""
+    return (
+        code in EMPTY_BODY_STATUS_CODES
+        or method in EMPTY_BODY_METHODS
+        or (200 <= code < 300 and method in hdrs.METH_CONNECT_ALL)
+    )
+
+
+def should_remove_content_length(method: str, code: int) -> bool:
+    """Check if a Content-Length header should be removed.
+
+    This should always be a subset of must_be_empty_body
+    """
+    # https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6-8
+    # https://www.rfc-editor.org/rfc/rfc9110.html#section-15.4.5-4
+    return code in EMPTY_BODY_STATUS_CODES or (
+        200 <= code < 300 and method in hdrs.METH_CONNECT_ALL
+    )
