@@ -1,261 +1,188 @@
-import logging
-import socket
-from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence, Sized
-from http.cookies import BaseCookie, Morsel
-from typing import TYPE_CHECKING, Any, TypedDict
+# Copyright 2007 Google, Inc. All Rights Reserved.
+# Licensed to PSF under a Contributor Agreement.
 
-from multidict import CIMultiDict
-from yarl import URL
-
-from ._cookie_helpers import parse_set_cookie_headers
-from .typedefs import LooseCookies
-
-if TYPE_CHECKING:
-    from .web_app import Application
-    from .web_exceptions import HTTPException
-    from .web_request import BaseRequest, Request
-    from .web_response import StreamResponse
-else:
-    BaseRequest = Request = Application = StreamResponse = Any
-    HTTPException = Any
+"""Abstract Base Classes (ABCs) according to PEP 3119."""
 
 
-class AbstractRouter(ABC):
-    def __init__(self) -> None:
-        self._frozen = False
+def abstractmethod(funcobj):
+    """A decorator indicating abstract methods.
 
-    def post_init(self, app: Application) -> None:
-        """Post init stage.
+    Requires that the metaclass is ABCMeta or derived from it.  A
+    class that has a metaclass derived from ABCMeta cannot be
+    instantiated unless all of its abstract methods are overridden.
+    The abstract methods can be called using any of the normal
+    'super' call mechanisms.  abstractmethod() may be used to declare
+    abstract methods for properties and descriptors.
 
-        Not an abstract method for sake of backward compatibility,
-        but if the router wants to be aware of the application
-        it can override this.
-        """
+    Usage:
 
-    @property
-    def frozen(self) -> bool:
-        return self._frozen
-
-    def freeze(self) -> None:
-        """Freeze router."""
-        self._frozen = True
-
-    @abstractmethod
-    async def resolve(self, request: Request) -> "AbstractMatchInfo":
-        """Return MATCH_INFO for given request"""
+        class C(metaclass=ABCMeta):
+            @abstractmethod
+            def my_abstract_method(self, arg1, arg2, argN):
+                ...
+    """
+    funcobj.__isabstractmethod__ = True
+    return funcobj
 
 
-class AbstractMatchInfo(ABC):
+class abstractclassmethod(classmethod):
+    """A decorator indicating abstract classmethods.
 
-    __slots__ = ()
+    Deprecated, use 'classmethod' with 'abstractmethod' instead:
 
-    @property  # pragma: no branch
-    @abstractmethod
-    def handler(self) -> Callable[[Request], Awaitable[StreamResponse]]:
-        """Execute matched request handler"""
+        class C(ABC):
+            @classmethod
+            @abstractmethod
+            def my_abstract_classmethod(cls, ...):
+                ...
 
-    @property
-    @abstractmethod
-    def expect_handler(
-        self,
-    ) -> Callable[[Request], Awaitable[StreamResponse | None]]:
-        """Expect handler for 100-continue processing"""
-
-    @property  # pragma: no branch
-    @abstractmethod
-    def http_exception(self) -> HTTPException | None:
-        """HTTPException instance raised on router's resolving, or None"""
-
-    @abstractmethod  # pragma: no branch
-    def get_info(self) -> dict[str, Any]:
-        """Return a dict with additional info useful for introspection"""
-
-    @property  # pragma: no branch
-    @abstractmethod
-    def apps(self) -> tuple[Application, ...]:
-        """Stack of nested applications.
-
-        Top level application is left-most element.
-
-        """
-
-    @abstractmethod
-    def add_app(self, app: Application) -> None:
-        """Add application to the nested apps stack."""
-
-    @abstractmethod
-    def freeze(self) -> None:
-        """Freeze the match info.
-
-        The method is called after route resolution.
-
-        After the call .add_app() is forbidden.
-
-        """
-
-
-class AbstractView(ABC):
-    """Abstract class based view."""
-
-    def __init__(self, request: Request) -> None:
-        self._request = request
-
-    @property
-    def request(self) -> Request:
-        """Request instance."""
-        return self._request
-
-    @abstractmethod
-    def __await__(self) -> Generator[None, None, StreamResponse]:
-        """Execute the view handler."""
-
-
-class ResolveResult(TypedDict):
-    """Resolve result.
-
-    This is the result returned from an AbstractResolver's
-    resolve method.
-
-    :param hostname: The hostname that was provided.
-    :param host: The IP address that was resolved.
-    :param port: The port that was resolved.
-    :param family: The address family that was resolved.
-    :param proto: The protocol that was resolved.
-    :param flags: The flags that were resolved.
     """
 
-    hostname: str
-    host: str
-    port: int
-    family: int
-    proto: int
-    flags: int
+    __isabstractmethod__ = True
+
+    def __init__(self, callable):
+        callable.__isabstractmethod__ = True
+        super().__init__(callable)
 
 
-class AbstractResolver(ABC):
-    """Abstract DNS resolver."""
+class abstractstaticmethod(staticmethod):
+    """A decorator indicating abstract staticmethods.
 
-    @abstractmethod
-    async def resolve(
-        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
-    ) -> list[ResolveResult]:
-        """Return IP address for given hostname"""
+    Deprecated, use 'staticmethod' with 'abstractmethod' instead:
 
-    @abstractmethod
-    async def close(self) -> None:
-        """Release resolver"""
+        class C(ABC):
+            @staticmethod
+            @abstractmethod
+            def my_abstract_staticmethod(...):
+                ...
 
+    """
 
-ClearCookiePredicate = Callable[[Morsel[str]], bool]
+    __isabstractmethod__ = True
 
-
-class AbstractCookieJar(Sized, Iterable[Morsel[str]]):
-    """Abstract Cookie Jar."""
-
-    @property
-    @abstractmethod
-    def quote_cookie(self) -> bool:
-        """Return True if cookies should be quoted."""
-
-    @abstractmethod
-    def clear(self, predicate: ClearCookiePredicate | None = None) -> None:
-        """Clear all cookies if no predicate is passed."""
-
-    @abstractmethod
-    def clear_domain(self, domain: str) -> None:
-        """Clear all cookies for domain and all subdomains."""
-
-    @abstractmethod
-    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
-        """Update cookies."""
-
-    def update_cookies_from_headers(
-        self, headers: Sequence[str], response_url: URL
-    ) -> None:
-        """Update cookies from raw Set-Cookie headers."""
-        if headers and (cookies_to_update := parse_set_cookie_headers(headers)):
-            self.update_cookies(cookies_to_update, response_url)
-
-    @abstractmethod
-    def filter_cookies(self, request_url: URL) -> BaseCookie[str]:
-        """Return the jar's cookies filtered by their attributes."""
+    def __init__(self, callable):
+        callable.__isabstractmethod__ = True
+        super().__init__(callable)
 
 
-class AbstractStreamWriter(ABC):
-    """Abstract stream writer."""
+class abstractproperty(property):
+    """A decorator indicating abstract properties.
 
-    buffer_size: int = 0
-    output_size: int = 0
-    length: int | None = 0
+    Deprecated, use 'property' with 'abstractmethod' instead:
 
-    @abstractmethod
-    async def write(
-        self, chunk: "bytes | bytearray | memoryview[int] | memoryview[bytes]"
-    ) -> None:
-        """Write chunk into stream."""
+        class C(ABC):
+            @property
+            @abstractmethod
+            def my_abstract_property(self):
+                ...
 
-    @abstractmethod
-    async def write_eof(self, chunk: bytes = b"") -> None:
-        """Write last chunk."""
+    """
 
-    @abstractmethod
-    async def drain(self) -> None:
-        """Flush the write buffer."""
+    __isabstractmethod__ = True
 
-    @abstractmethod
-    def enable_compression(
-        self, encoding: str = "deflate", strategy: int | None = None
-    ) -> None:
-        """Enable HTTP body compression"""
 
-    @abstractmethod
-    def enable_chunking(self) -> None:
-        """Enable HTTP chunked mode"""
+try:
+    from _abc import (get_cache_token, _abc_init, _abc_register,
+                      _abc_instancecheck, _abc_subclasscheck, _get_dump,
+                      _reset_registry, _reset_caches)
+except ImportError:
+    from _py_abc import ABCMeta, get_cache_token
+    ABCMeta.__module__ = 'abc'
+else:
+    class ABCMeta(type):
+        """Metaclass for defining Abstract Base Classes (ABCs).
 
-    @abstractmethod
-    async def write_headers(self, status_line: str, headers: CIMultiDict[str]) -> None:
-        """Write HTTP headers"""
-
-    def send_headers(self) -> None:
-        """Force sending buffered headers if not already sent.
-
-        Required only if write_headers() buffers headers instead of sending immediately.
-        For backwards compatibility, this method does nothing by default.
+        Use this metaclass to create an ABC.  An ABC can be subclassed
+        directly, and then acts as a mix-in class.  You can also register
+        unrelated concrete classes (even built-in classes) and unrelated
+        ABCs as 'virtual subclasses' -- these and their descendants will
+        be considered subclasses of the registering ABC by the built-in
+        issubclass() function, but the registering ABC won't show up in
+        their MRO (Method Resolution Order) nor will method
+        implementations defined by the registering ABC be callable (not
+        even via super()).
         """
+        def __new__(mcls, name, bases, namespace, /, **kwargs):
+            cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+            _abc_init(cls)
+            return cls
+
+        def register(cls, subclass):
+            """Register a virtual subclass of an ABC.
+
+            Returns the subclass, to allow usage as a class decorator.
+            """
+            return _abc_register(cls, subclass)
+
+        def __instancecheck__(cls, instance):
+            """Override for isinstance(instance, cls)."""
+            return _abc_instancecheck(cls, instance)
+
+        def __subclasscheck__(cls, subclass):
+            """Override for issubclass(subclass, cls)."""
+            return _abc_subclasscheck(cls, subclass)
+
+        def _dump_registry(cls, file=None):
+            """Debug helper to print the ABC registry."""
+            print(f"Class: {cls.__module__}.{cls.__qualname__}", file=file)
+            print(f"Inv. counter: {get_cache_token()}", file=file)
+            (_abc_registry, _abc_cache, _abc_negative_cache,
+             _abc_negative_cache_version) = _get_dump(cls)
+            print(f"_abc_registry: {_abc_registry!r}", file=file)
+            print(f"_abc_cache: {_abc_cache!r}", file=file)
+            print(f"_abc_negative_cache: {_abc_negative_cache!r}", file=file)
+            print(f"_abc_negative_cache_version: {_abc_negative_cache_version!r}",
+                  file=file)
+
+        def _abc_registry_clear(cls):
+            """Clear the registry (for debugging or testing)."""
+            _reset_registry(cls)
+
+        def _abc_caches_clear(cls):
+            """Clear the caches (for debugging or testing)."""
+            _reset_caches(cls)
 
 
-class AbstractAccessLogger(ABC):
-    """Abstract writer to access log."""
+def update_abstractmethods(cls):
+    """Recalculate the set of abstract methods of an abstract class.
 
-    __slots__ = ("logger", "log_format")
+    If a class has had one of its abstract methods implemented after the
+    class was created, the method will not be considered implemented until
+    this function is called. Alternatively, if a new abstract method has been
+    added to the class, it will only be considered an abstract method of the
+    class after this function is called.
 
-    def __init__(self, logger: logging.Logger, log_format: str) -> None:
-        self.logger = logger
-        self.log_format = log_format
+    This function should be called before any use is made of the class,
+    usually in class decorators that add methods to the subject class.
 
-    @abstractmethod
-    def log(self, request: BaseRequest, response: StreamResponse, time: float) -> None:
-        """Emit log to logger."""
+    Returns cls, to allow usage as a class decorator.
 
-    @property
-    def enabled(self) -> bool:
-        """Check if logger is enabled."""
-        return True
+    If cls is not an instance of ABCMeta, does nothing.
+    """
+    if not hasattr(cls, '__abstractmethods__'):
+        # We check for __abstractmethods__ here because cls might by a C
+        # implementation or a python implementation (especially during
+        # testing), and we want to handle both cases.
+        return cls
+
+    abstracts = set()
+    # Check the existing abstract methods of the parents, keep only the ones
+    # that are not implemented.
+    for scls in cls.__bases__:
+        for name in getattr(scls, '__abstractmethods__', ()):
+            value = getattr(cls, name, None)
+            if getattr(value, "__isabstractmethod__", False):
+                abstracts.add(name)
+    # Also add any other newly added abstract methods.
+    for name, value in cls.__dict__.items():
+        if getattr(value, "__isabstractmethod__", False):
+            abstracts.add(name)
+    cls.__abstractmethods__ = frozenset(abstracts)
+    return cls
 
 
-class AbstractAsyncAccessLogger(ABC):
-    """Abstract asynchronous writer to access log."""
-
+class ABC(metaclass=ABCMeta):
+    """Helper class that provides a standard way to create an ABC using
+    inheritance.
+    """
     __slots__ = ()
-
-    @abstractmethod
-    async def log(
-        self, request: BaseRequest, response: StreamResponse, request_start: float
-    ) -> None:
-        """Emit log to logger."""
-
-    @property
-    def enabled(self) -> bool:
-        """Check if logger is enabled."""
-        return True
