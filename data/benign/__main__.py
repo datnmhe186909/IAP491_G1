@@ -1,3 +1,7 @@
-from .cli import main
+"""
+IDLE main entry point
 
-main()
+Run IDLE as python -m idlelib
+"""
+import idlelib.pyshell
+idlelib.pyshell.main()
