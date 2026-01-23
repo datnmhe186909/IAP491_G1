@@ -1,249 +1,335 @@
-"""Custom warnings and errors used across scikit-learn."""
+from __future__ import annotations
 
-# Authors: The scikit-learn developers
-# SPDX-License-Identifier: BSD-3-Clause
+import socket
+import typing
+import warnings
+from email.errors import MessageDefect
+from http.client import IncompleteRead as httplib_IncompleteRead
 
-__all__ = [
-    "ConvergenceWarning",
-    "DataConversionWarning",
-    "DataDimensionalityWarning",
-    "EfficiencyWarning",
-    "EstimatorCheckFailedWarning",
-    "FitFailedWarning",
-    "NotFittedError",
-    "PositiveSpectrumWarning",
-    "SkipTestWarning",
-    "UndefinedMetricWarning",
-    "UnsetMetadataPassedError",
-]
+if typing.TYPE_CHECKING:
+    from .connection import HTTPConnection
+    from .connectionpool import ConnectionPool
+    from .response import HTTPResponse
+    from .util.retry import Retry
+
+# Base Exceptions
 
 
-class UnsetMetadataPassedError(ValueError):
-    """Exception class to raise if a metadata is passed which is not explicitly \
-        requested (metadata=True) or not requested (metadata=False).
+class HTTPError(Exception):
+    """Base exception used by this module."""
 
-    .. versionadded:: 1.3
 
-    Parameters
-    ----------
-    message : str
-        The message
+class HTTPWarning(Warning):
+    """Base warning used by this module."""
 
-    unrequested_params : dict
-        A dictionary of parameters and their values which are provided but not
-        requested.
 
-    routed_params : dict
-        A dictionary of routed parameters.
+_TYPE_REDUCE_RESULT = tuple[typing.Callable[..., object], tuple[object, ...]]
+
+
+class PoolError(HTTPError):
+    """Base exception for errors caused within a pool."""
+
+    def __init__(self, pool: ConnectionPool, message: str) -> None:
+        self.pool = pool
+        self._message = message
+        super().__init__(f"{pool}: {message}")
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (None, self._message)
+
+
+class RequestError(PoolError):
+    """Base exception for PoolErrors that have associated URLs."""
+
+    def __init__(self, pool: ConnectionPool, url: str | None, message: str) -> None:
+        self.url = url
+        super().__init__(pool, message)
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (None, self.url, self._message)
+
+
+class SSLError(HTTPError):
+    """Raised when SSL certificate fails in an HTTPS connection."""
+
+
+class ProxyError(HTTPError):
+    """Raised when the connection to a proxy fails."""
+
+    # The original error is also available as __cause__.
+    original_error: Exception
+
+    def __init__(self, message: str, error: Exception) -> None:
+        super().__init__(message, error)
+        self.original_error = error
+
+
+class DecodeError(HTTPError):
+    """Raised when automatic decoding based on Content-Type fails."""
+
+
+class ProtocolError(HTTPError):
+    """Raised when something unexpected happens mid-request/response."""
+
+
+#: Renamed to ProtocolError but aliased for backwards compatibility.
+ConnectionError = ProtocolError
+
+
+# Leaf Exceptions
+
+
+class MaxRetryError(RequestError):
+    """Raised when the maximum number of retries is exceeded.
+
+    :param pool: The connection pool
+    :type pool: :class:`~urllib3.connectionpool.HTTPConnectionPool`
+    :param str url: The requested Url
+    :param reason: The underlying error
+    :type reason: :class:`Exception`
+
     """
 
-    def __init__(self, *, message, unrequested_params, routed_params):
+    def __init__(
+        self, pool: ConnectionPool, url: str | None, reason: Exception | None = None
+    ) -> None:
+        self.reason = reason
+
+        message = f"Max retries exceeded with url: {url} (Caused by {reason!r})"
+
+        super().__init__(pool, url, message)
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (None, self.url, self.reason)
+
+
+class HostChangedError(RequestError):
+    """Raised when an existing pool gets a request for a foreign host."""
+
+    def __init__(
+        self, pool: ConnectionPool, url: str, retries: Retry | int = 3
+    ) -> None:
+        message = f"Tried to open a foreign host with url: {url}"
+        super().__init__(pool, url, message)
+        self.retries = retries
+
+
+class TimeoutStateError(HTTPError):
+    """Raised when passing an invalid state to a timeout"""
+
+
+class TimeoutError(HTTPError):
+    """Raised when a socket timeout error occurs.
+
+    Catching this error will catch both :exc:`ReadTimeoutErrors
+    <ReadTimeoutError>` and :exc:`ConnectTimeoutErrors <ConnectTimeoutError>`.
+    """
+
+
+class ReadTimeoutError(TimeoutError, RequestError):
+    """Raised when a socket timeout occurs while receiving data from a server"""
+
+
+# This timeout error does not have a URL attached and needs to inherit from the
+# base HTTPError
+class ConnectTimeoutError(TimeoutError):
+    """Raised when a socket timeout occurs while connecting to a server"""
+
+
+class NewConnectionError(ConnectTimeoutError, HTTPError):
+    """Raised when we fail to establish a new connection. Usually ECONNREFUSED."""
+
+    def __init__(self, conn: HTTPConnection, message: str) -> None:
+        self.conn = conn
+        self._message = message
+        super().__init__(f"{conn}: {message}")
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (None, self._message)
+
+    @property
+    def pool(self) -> HTTPConnection:
+        warnings.warn(
+            "The 'pool' property is deprecated and will be removed "
+            "in urllib3 v2.1.0. Use 'conn' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        return self.conn
+
+
+class NameResolutionError(NewConnectionError):
+    """Raised when host name resolution fails."""
+
+    def __init__(self, host: str, conn: HTTPConnection, reason: socket.gaierror):
+        message = f"Failed to resolve '{host}' ({reason})"
+        self._host = host
+        self._reason = reason
+        super().__init__(conn, message)
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (self._host, None, self._reason)
+
+
+class EmptyPoolError(PoolError):
+    """Raised when a pool runs out of connections and no more are allowed."""
+
+
+class FullPoolError(PoolError):
+    """Raised when we try to add a connection to a full pool in blocking mode."""
+
+
+class ClosedPoolError(PoolError):
+    """Raised when a request enters a pool after the pool has been closed."""
+
+
+class LocationValueError(ValueError, HTTPError):
+    """Raised when there is something wrong with a given URL input."""
+
+
+class LocationParseError(LocationValueError):
+    """Raised when get_host or similar fails to parse the URL input."""
+
+    def __init__(self, location: str) -> None:
+        message = f"Failed to parse: {location}"
         super().__init__(message)
-        self.unrequested_params = unrequested_params
-        self.routed_params = routed_params
+
+        self.location = location
 
 
-class NotFittedError(ValueError, AttributeError):
-    """Exception class to raise if estimator is used before fitting.
+class URLSchemeUnknown(LocationValueError):
+    """Raised when a URL input has an unsupported scheme."""
 
-    This class inherits from both ValueError and AttributeError to help with
-    exception handling and backward compatibility.
+    def __init__(self, scheme: str):
+        message = f"Not supported URL scheme {scheme}"
+        super().__init__(message)
 
-    Examples
-    --------
-    >>> from sklearn.svm import LinearSVC
-    >>> from sklearn.exceptions import NotFittedError
-    >>> try:
-    ...     LinearSVC().predict([[1, 2], [2, 3], [3, 4]])
-    ... except NotFittedError as e:
-    ...     print(repr(e))
-    NotFittedError("This LinearSVC instance is not fitted yet. Call 'fit' with
-    appropriate arguments before using this estimator."...)
+        self.scheme = scheme
 
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.validation.
+
+class ResponseError(HTTPError):
+    """Used as a container for an error reason supplied in a MaxRetryError."""
+
+    GENERIC_ERROR = "too many error responses"
+    SPECIFIC_ERROR = "too many {status_code} error responses"
+
+
+class SecurityWarning(HTTPWarning):
+    """Warned when performing security reducing actions"""
+
+
+class InsecureRequestWarning(SecurityWarning):
+    """Warned when making an unverified HTTPS request."""
+
+
+class NotOpenSSLWarning(SecurityWarning):
+    """Warned when using unsupported SSL library"""
+
+
+class SystemTimeWarning(SecurityWarning):
+    """Warned when system time is suspected to be wrong"""
+
+
+class InsecurePlatformWarning(SecurityWarning):
+    """Warned when certain TLS/SSL configuration is not available on a platform."""
+
+
+class DependencyWarning(HTTPWarning):
+    """
+    Warned when an attempt is made to import a module with missing optional
+    dependencies.
     """
 
 
-class ConvergenceWarning(UserWarning):
-    """Custom warning to capture convergence problems
+class ResponseNotChunked(ProtocolError, ValueError):
+    """Response needs to be chunked in order to read it as chunks."""
 
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.
+
+class BodyNotHttplibCompatible(HTTPError):
+    """
+    Body should be :class:`http.client.HTTPResponse` like
+    (have an fp attribute which returns raw chunks) for read_chunked().
     """
 
 
-class DataConversionWarning(UserWarning):
-    """Warning used to notify implicit data conversions happening in the code.
+class IncompleteRead(HTTPError, httplib_IncompleteRead):
+    """
+    Response length doesn't match expected Content-Length
 
-    This warning occurs when some input data needs to be converted or
-    interpreted in a way that may not match the user's expectations.
-
-    For example, this warning may occur when the user
-        - passes an integer array to a function which expects float input and
-          will convert the input
-        - requests a non-copying operation, but a copy is required to meet the
-          implementation's data-type expectations;
-        - passes an input whose shape can be interpreted ambiguously.
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.validation.
+    Subclass of :class:`http.client.IncompleteRead` to allow int value
+    for ``partial`` to avoid creating large objects on streamed reads.
     """
 
+    partial: int  # type: ignore[assignment]
+    expected: int
 
-class DataDimensionalityWarning(UserWarning):
-    """Custom warning to notify potential issues with data dimensionality.
+    def __init__(self, partial: int, expected: int) -> None:
+        self.partial = partial
+        self.expected = expected
 
-    For example, in random projection, this warning is raised when the
-    number of components, which quantifies the dimensionality of the target
-    projection space, is higher than the number of features, which quantifies
-    the dimensionality of the original source space, to imply that the
-    dimensionality of the problem will not be reduced.
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.utils.
-    """
-
-
-class EfficiencyWarning(UserWarning):
-    """Warning used to notify the user of inefficient computation.
-
-    This warning notifies the user that the efficiency may not be optimal due
-    to some reason which may be included as a part of the warning message.
-    This may be subclassed into a more specific Warning class.
-
-    .. versionadded:: 0.18
-    """
+    def __repr__(self) -> str:
+        return "IncompleteRead(%i bytes read, %i more expected)" % (
+            self.partial,
+            self.expected,
+        )
 
 
-class FitFailedWarning(RuntimeWarning):
-    """Warning class used if there is an error while fitting the estimator.
+class InvalidChunkLength(HTTPError, httplib_IncompleteRead):
+    """Invalid chunk length in a chunked response."""
 
-    This Warning is used in meta estimators GridSearchCV and RandomizedSearchCV
-    and the cross-validation helper function cross_val_score to warn when there
-    is an error while fitting the estimator.
+    def __init__(self, response: HTTPResponse, length: bytes) -> None:
+        self.partial: int = response.tell()  # type: ignore[assignment]
+        self.expected: int | None = response.length_remaining
+        self.response = response
+        self.length = length
 
-    .. versionchanged:: 0.18
-       Moved from sklearn.cross_validation.
-    """
-
-
-class SkipTestWarning(UserWarning):
-    """Warning class used to notify the user of a test that was skipped.
-
-    For example, one of the estimator checks requires a pandas import.
-    If the pandas package cannot be imported, the test will be skipped rather
-    than register as a failure.
-    """
+    def __repr__(self) -> str:
+        return "InvalidChunkLength(got length %r, %i bytes read)" % (
+            self.length,
+            self.partial,
+        )
 
 
-class UndefinedMetricWarning(UserWarning):
-    """Warning used when the metric is invalid
-
-    .. versionchanged:: 0.18
-       Moved from sklearn.base.
-    """
+class InvalidHeader(HTTPError):
+    """The header provided was somehow invalid."""
 
 
-class PositiveSpectrumWarning(UserWarning):
-    """Warning raised when the eigenvalues of a PSD matrix have issues
+class ProxySchemeUnknown(AssertionError, URLSchemeUnknown):
+    """ProxyManager does not support the supplied scheme"""
 
-    This warning is typically raised by ``_check_psd_eigenvalues`` when the
-    eigenvalues of a positive semidefinite (PSD) matrix such as a gram matrix
-    (kernel) present significant negative eigenvalues, or bad conditioning i.e.
-    very small non-zero eigenvalues compared to the largest eigenvalue.
+    # TODO(t-8ch): Stop inheriting from AssertionError in v2.0.
 
-    .. versionadded:: 0.22
-    """
+    def __init__(self, scheme: str | None) -> None:
+        # 'localhost' is here because our URL parser parses
+        # localhost:8080 -> scheme=localhost, remove if we fix this.
+        if scheme == "localhost":
+            scheme = None
+        if scheme is None:
+            message = "Proxy URL had no scheme, should start with http:// or https://"
+        else:
+            message = f"Proxy URL had unsupported scheme {scheme}, should use http:// or https://"
+        super().__init__(message)
 
 
-class InconsistentVersionWarning(UserWarning):
-    """Warning raised when an estimator is unpickled with an inconsistent version.
+class ProxySchemeUnsupported(ValueError):
+    """Fetching HTTPS resources through HTTPS proxies is unsupported"""
 
-    Parameters
-    ----------
-    estimator_name : str
-        Estimator name.
 
-    current_sklearn_version : str
-        Current scikit-learn version.
-
-    original_sklearn_version : str
-        Original scikit-learn version.
-    """
+class HeaderParsingError(HTTPError):
+    """Raised by assert_header_parsing, but we convert it to a log.warning statement."""
 
     def __init__(
-        self, *, estimator_name, current_sklearn_version, original_sklearn_version
-    ):
-        self.estimator_name = estimator_name
-        self.current_sklearn_version = current_sklearn_version
-        self.original_sklearn_version = original_sklearn_version
-
-    def __str__(self):
-        return (
-            f"Trying to unpickle estimator {self.estimator_name} from version"
-            f" {self.original_sklearn_version} when "
-            f"using version {self.current_sklearn_version}. This might lead to breaking"
-            " code or "
-            "invalid results. Use at your own risk. "
-            "For more info please refer to:\n"
-            "https://scikit-learn.org/stable/model_persistence.html"
-            "#security-maintainability-limitations"
-        )
+        self, defects: list[MessageDefect], unparsed_data: bytes | str | None
+    ) -> None:
+        message = f"{defects or 'Unknown'}, unparsed data: {unparsed_data!r}"
+        super().__init__(message)
 
 
-class EstimatorCheckFailedWarning(UserWarning):
-    """Warning raised when an estimator check from the common tests fails.
-
-    Parameters
-    ----------
-    estimator : estimator object
-        Estimator instance for which the test failed.
-
-    check_name : str
-        Name of the check that failed.
-
-    exception : Exception
-        Exception raised by the failed check.
-
-    status : str
-        Status of the check.
-
-    expected_to_fail : bool
-        Whether the check was expected to fail.
-
-    expected_to_fail_reason : str
-        Reason for the expected failure.
-    """
-
-    def __init__(
-        self,
-        *,
-        estimator,
-        check_name: str,
-        exception: Exception,
-        status: str,
-        expected_to_fail: bool,
-        expected_to_fail_reason: str,
-    ):
-        self.estimator = estimator
-        self.check_name = check_name
-        self.exception = exception
-        self.status = status
-        self.expected_to_fail = expected_to_fail
-        self.expected_to_fail_reason = expected_to_fail_reason
-
-    def __repr__(self):
-        expected_to_fail_str = (
-            f"Expected to fail: {self.expected_to_fail_reason}"
-            if self.expected_to_fail
-            else "Not expected to fail"
-        )
-        return (
-            f"Test {self.check_name} failed for estimator {self.estimator!r}.\n"
-            f"Expected to fail reason: {expected_to_fail_str}\n"
-            f"Exception: {self.exception}"
-        )
-
-    def __str__(self):
-        return self.__repr__()
+class UnrewindableBodyError(HTTPError):
+    """urllib3 encountered an error when trying to rewind a body"""
